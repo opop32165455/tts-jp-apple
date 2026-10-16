@@ -56,14 +56,31 @@ action() { # label, manage_service.sh subcommand
   echo "$1 | bash=$MANAGE param1=$2 terminal=false refresh=true"
 }
 
+switch_cmd() { # engine, on|off
+  echo "bash=/usr/bin/curl param1=-s param2=-m param3=300 param4=-X param5=POST param6=$BASE_URL/v1/services/$1/$2 terminal=false refresh=true"
+}
+
 engine_item() { # engine (tts|stt), display name
-  local st load
+  local st detail unload_in
   st="$(json_field "$1")"
-  if [[ "$1" == "tts" ]]; then load="$(json_field model_load_seconds)"; else load="$(json_field stt_load_seconds)"; fi
+  if [[ "$1" == "tts" ]]; then
+    case "$st" in
+      on) detail="已加载，点击关闭" ;;
+      *)  detail="已关闭，点击开启" ;;
+    esac
+  else
+    unload_in="$(json_field stt_unload_in_seconds)"
+    case "$st" in
+      on) [[ "$unload_in" =~ ^[0-9]+$ ]] \
+            && detail="已加载，空闲 $(( (unload_in + 59) / 60 )) 分钟后自动卸载，点击立即卸载" \
+            || detail="已加载，点击卸载" ;;
+      *)  detail="未加载，调用时自动加载，点击预加载" ;;
+    esac
+  fi
   case "$st" in
-    on)      echo "$2（已加载 ${load}s，点击关闭） | checked=true bash=/usr/bin/curl param1=-s param2=-m param3=300 param4=-X param5=POST param6=$BASE_URL/v1/services/$1/off terminal=false refresh=true" ;;
+    on)      echo "$2（$detail） | checked=true $(switch_cmd "$1" off)" ;;
     loading) echo "$2（加载中…） | color=#FF9F0A" ;;
-    *)       echo "$2（未加载，点击开启） | bash=/usr/bin/curl param1=-s param2=-m param3=300 param4=-X param5=POST param6=$BASE_URL/v1/services/$1/on terminal=false refresh=true" ;;
+    *)       echo "$2（$detail） | $(switch_cmd "$1" on)" ;;
   esac
 }
 
@@ -77,7 +94,7 @@ if [[ "$state" == "running" ]]; then
   echo "---"
   engine_item tts "TTS 语音合成"
   engine_item stt "STT 语音识别"
-  echo "引擎开关在服务重启后恢复默认（TTS 开、STT 关） | size=11 color=#8E8E93"
+  echo "服务重启后恢复默认：TTS 常驻，STT 按需加载 | size=11 color=#8E8E93"
 elif [[ -n "$pid" && "$pid" != "-" ]]; then
   echo "PID $pid · 端口 $PORT | size=12"
 fi

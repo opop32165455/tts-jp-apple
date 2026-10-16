@@ -98,19 +98,23 @@ TTS 模型加载期间返回 `503`，其他时候返回各引擎的状态（`on`
 
 ```json
 { "status": "ok", "service": "speech_server", "lang_code": "japanese",
-  "tts": "on", "stt": "off", "model_load_seconds": 3.42, "stt_load_seconds": 0.0 }
+  "tts": "on", "stt": "off", "model_load_seconds": 3.42, "stt_load_seconds": 0.0,
+  "stt_idle_unload_seconds": 600, "stt_unload_in_seconds": null }
 ```
 
 ### `GET /v1/services`、`POST /v1/services/{tts|stt}/{on|off}` — 引擎开关
 
-TTS 和 STT 可以在运行中单独加载或卸载，不用重启进程。卸载后模型占用的内存会被释放，此时再调用对应接口会返回 `503`。返回值和 `/health` 里的引擎字段一致。
+TTS 和 STT 可以在运行中单独加载或卸载，不用重启进程，卸载后模型占用的内存会被释放。返回值和 `/health` 里的引擎字段一致。
+
+- **TTS**：常驻内存。手动关闭后，`/v1/tts` 会返回 `503`，直到重新打开。
+- **STT**：按需加载。卸载状态下收到识别请求时会自动加载模型（这次请求要多等约 2 秒），连续空闲 10 分钟（`SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS`）后自动卸载，可以省下约 1.5～2 GB 内存。`on` 用来提前预加载，`off` 用来立即卸载。
 
 ```bash
-curl -X POST http://127.0.0.1:7790/v1/services/stt/on    # 加载 Whisper（首次需要下载模型）
-curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 卸载 Whisper，释放内存
+curl -X POST http://127.0.0.1:7790/v1/services/stt/on    # 预加载 Whisper（第一次会下载模型）
+curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 立即卸载，释放内存
 ```
 
-开关状态不会保存：服务重启后恢复成 `SPEECH_SERVER_TTS_ENABLED` / `SPEECH_SERVER_STT_ENABLED` 设定的值（默认 TTS 开、STT 关）。
+开关状态不会保存：服务重启后恢复成环境变量设定的值（默认 TTS 开，STT 不预加载）。
 
 ### `GET /v1/config`
 
@@ -134,7 +138,7 @@ curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 卸载 Whisper，释�
 
 ### `POST /v1/transcribe`（别名 `/v1/stt`）— 语音识别
 
-STT 默认是关闭的，需要先执行 `POST /v1/services/stt/on`（或在菜单栏里打开），否则返回 `503`。
+STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 秒；之后的请求直接使用已加载的模型。
 
 - Query 参数：`language`（例如 `ja`、`zh`、`en`）
 - 请求体：音频二进制（WAV / MP3 / M4A / OGG / FLAC / WebM）
@@ -162,7 +166,8 @@ STT 默认是关闭的，需要先执行 `POST /v1/services/stt/on`（或在菜�
 | `SPEECH_SERVER_MAX_TOKENS` | `512` | 默认最大 token 数 |
 | `SPEECH_SERVER_MLX_WHISPER_MODEL` | `mlx-community/whisper-large-v3-turbo` | STT 模型 |
 | `SPEECH_SERVER_TTS_ENABLED` | `1` | 启动时是否加载 TTS |
-| `SPEECH_SERVER_STT_ENABLED` | `0` | 启动时是否加载 STT（很少用，所以默认不加载） |
+| `SPEECH_SERVER_STT_ENABLED` | `0` | 启动时是否预加载 STT（不预加载时，调用时会自动加载） |
+| `SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS` | `600` | STT 空闲多少秒后自动卸载，`0` 表示不卸载 |
 
 旧的 `YUNA_TTS_*` 同名变量仍然兼容。
 
@@ -191,7 +196,7 @@ STT 默认是关闭的，需要先执行 `POST /v1/services/stt/on`（或在菜�
 - 🟢 运行中且 TTS 已开启，🔵 进程在运行但 TTS 已关闭，🟠 启动中或模型加载中，🔴 异常退出（launchd 正在重启），⚪ 已停止或未安装
 - 下拉菜单：
   - PID / 端口 / 语言
-  - **TTS / STT 开关**：已开启的显示 ✓，点击即可加载或卸载对应模型（调用 `/v1/services`）
+  - **TTS / STT 开关**：已加载的显示 ✓，点击即可加载或卸载对应模型（调用 `/v1/services`）。STT 加载后还会显示多久后自动卸载
   - 启动 / 停止 / 重启（调用 `manage_service.sh`）
   - 实时日志、在控制台打开日志、`/v1/config`、打开项目目录
 
@@ -266,7 +271,7 @@ tts-jp-apple/
 - **开头的“噗”声**：声码器第一帧会产生直流冲击。服务端对输出加了 20 ms 线性淡入，客户端不需要再处理。
 - **短文本重复发音**：Qwen3-TTS 合成极短文本时，如果 `max_tokens` 过大，容易反复读同一个音。调用方没有传 `max_tokens` 且文本 ≤ 20 字时，服务会把它限制为 `max(32, min(默认值, 字数 × 8))`。生成的音频短于 0.3 秒会被当作截断，直接报错。
 - **并发**：`MODEL.generate()` 不是线程安全的，所有合成请求都会串行执行。每次请求结束后会清理 MLX 缓存（上限 2 GB），并执行 GC。
-- **STT 默认关闭**：Whisper 很少用，启动时不加载，需要时在菜单栏或用 `/v1/services/stt/on` 打开。关闭时，依赖 `/v1/transcribe` 的调用方会收到 `503`。
+- **STT 按需加载**：Whisper 很少用，所以启动时不加载，收到第一个识别请求时才加载，空闲 10 分钟后自动卸载。调用方不需要做任何改动，只是加载后的第一个请求会慢约 2 秒。
 - **STT 只用 MLX**：`mlx-whisper` 在 Apple Silicon 上比 CPU 版快 4~5 倍（4.5 分钟音频约 11 秒），日语识别也更准，时间戳不容易漂移，所以没有设计 CPU 回退。MLX 出错时会直接报错，不会悄悄降级。第一次调用要加载模型，大约需要 20 秒。
 - **STT 后处理**：用词级时间戳收紧每段的起止时间，丢掉短于 0.2 秒的段，并对重叠的段去重、重新排序。
 - **端口冲突**：先 `./manage_service.sh stop`，或者用 `SPEECH_SERVER_PORT` / `--port` 换一个端口。

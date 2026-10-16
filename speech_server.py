@@ -120,9 +120,16 @@ def _env_flag(name: str, legacy: str, default: bool) -> bool:
 
 
 # 启动时各引擎是否加载；运行中可用 POST /v1/services/{tts|stt}/{on|off} 切换（重启后恢复为这里的值）。
-# STT 很少用，默认不加载，省下 Whisper 的内存。
+# STT 很少用：默认不预加载，收到识别请求时自动加载，空闲 STT_IDLE_UNLOAD_SECONDS 后自动卸载（0 = 不卸载），
+# 省下 Whisper 约 1.5~2 GB 内存。
 DEFAULT_TTS_ENABLED = _env_flag("SPEECH_SERVER_TTS_ENABLED", "YUNA_TTS_TTS_ENABLED", True)
 DEFAULT_STT_ENABLED = _env_flag("SPEECH_SERVER_STT_ENABLED", "YUNA_TTS_STT_ENABLED", False)
+STT_IDLE_UNLOAD_SECONDS = int(
+    os.environ.get(
+        "SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS",
+        os.environ.get("YUNA_TTS_STT_IDLE_UNLOAD_SECONDS", "600"),
+    )
+)
 
 
 # ==========================================
@@ -175,11 +182,13 @@ MODEL_LOAD_TIME = 0.0
 
 # Engine state: "off" | "loading" | "on". SERVICE_LOCK serializes on/off switching;
 # STT_LOCK keeps the Whisper model from being unloaded mid-transcription.
+# Lock order is always SERVICE_LOCK -> STT_LOCK; never load while holding STT_LOCK.
 SERVICE_LOCK = threading.Lock()
 STT_LOCK = threading.Lock()
 TTS_STATE = "off"
 STT_STATE = "off"
 STT_LOAD_TIME = 0.0
+STT_LAST_USED = 0.0  # time.monotonic() of the last load or transcription
 
 
 class TTSRequest(BaseModel):
@@ -362,8 +371,19 @@ def set_tts_enabled(enabled: bool):
             logger.info("TTS model unloaded")
 
 
+def _unload_stt_locked():
+    """Caller holds SERVICE_LOCK and STT_LOCK."""
+    global STT_STATE
+    from mlx_whisper.transcribe import ModelHolder
+
+    ModelHolder.model = None
+    ModelHolder.model_path = None
+    STT_STATE = "off"
+    _release_mlx_memory()
+
+
 def set_stt_enabled(enabled: bool):
-    global STT_STATE, STT_LOAD_TIME
+    global STT_STATE, STT_LOAD_TIME, STT_LAST_USED
     import mlx.core as mx
     from mlx_whisper.transcribe import ModelHolder
 
@@ -379,15 +399,31 @@ def set_stt_enabled(enabled: bool):
                 STT_STATE = "off"
                 raise
             STT_LOAD_TIME = time.time() - started
+            STT_LAST_USED = time.monotonic()
             STT_STATE = "on"
             logger.info(f"Whisper model loaded in {STT_LOAD_TIME:.2f}s")
         elif not enabled and STT_STATE != "off":
             with STT_LOCK:  # waits for an in-flight transcription to finish
-                ModelHolder.model = None
-                ModelHolder.model_path = None
-            STT_STATE = "off"
-            _release_mlx_memory()
+                _unload_stt_locked()
             logger.info("Whisper model unloaded")
+
+
+def unload_stt_if_idle():
+    with SERVICE_LOCK, STT_LOCK:
+        idle = time.monotonic() - STT_LAST_USED
+        if STT_STATE == "on" and idle >= STT_IDLE_UNLOAD_SECONDS:
+            _unload_stt_locked()
+            logger.info(f"Whisper model unloaded after {idle:.0f}s idle")
+
+
+async def _stt_idle_watcher():
+    while True:
+        await asyncio.sleep(30)
+        if STT_STATE == "on" and time.monotonic() - STT_LAST_USED >= STT_IDLE_UNLOAD_SECONDS:
+            try:
+                await asyncio.to_thread(unload_stt_if_idle)
+            except Exception as exc:
+                logger.error(f"[STT IDLE UNLOAD ERROR] {exc!r}")
 
 
 @asynccontextmanager
@@ -401,7 +437,10 @@ async def lifespan(app: FastAPI):
         pass
     set_tts_enabled(DEFAULT_TTS_ENABLED)
     set_stt_enabled(DEFAULT_STT_ENABLED)
+    watcher = asyncio.create_task(_stt_idle_watcher()) if STT_IDLE_UNLOAD_SECONDS > 0 else None
     yield
+    if watcher:
+        watcher.cancel()
 
 
 app = FastAPI(
@@ -418,6 +457,12 @@ def _services_status() -> dict:
         "stt": STT_STATE,
         "model_load_seconds": round(MODEL_LOAD_TIME, 3),
         "stt_load_seconds": round(STT_LOAD_TIME, 3),
+        "stt_idle_unload_seconds": STT_IDLE_UNLOAD_SECONDS,
+        "stt_unload_in_seconds": (
+            max(0, int(STT_IDLE_UNLOAD_SECONDS - (time.monotonic() - STT_LAST_USED)))
+            if STT_STATE == "on" and STT_IDLE_UNLOAD_SECONDS > 0
+            else None
+        ),
     }
 
 
@@ -522,21 +567,28 @@ def _run_whisper(tmp_path: str, language: Optional[str]) -> dict:
     保留精度更低的 CPU 兜底，只会在 MLX 偶发失败时**静默产出劣质时间轴**，
     反而更难排查——因此直接让失败显性化（抛错，由调用方记 ERROR 并向后端返回失败）。
     """
+    global STT_LAST_USED
     import mlx_whisper
 
-    with STT_LOCK:
+    while True:
         if STT_STATE != "on":
-            # Checked again under the lock so a concurrent unload can't race us into a reload.
-            raise RuntimeError(f"STT is {STT_STATE}")
-        res = mlx_whisper.transcribe(
-            tmp_path,
-            path_or_hf_repo=DEFAULT_MLX_WHISPER_MODEL,
-            language=language,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            temperature=0.0,
-            verbose=False,
-        )
+            set_stt_enabled(True)  # load on demand; outside STT_LOCK to keep lock order
+        with STT_LOCK:
+            if STT_STATE != "on":
+                continue  # unloaded between load and lock (idle/manual off); load again
+            try:
+                res = mlx_whisper.transcribe(
+                    tmp_path,
+                    path_or_hf_repo=DEFAULT_MLX_WHISPER_MODEL,
+                    language=language,
+                    word_timestamps=True,
+                    condition_on_previous_text=False,
+                    temperature=0.0,
+                    verbose=False,
+                )
+            finally:
+                STT_LAST_USED = time.monotonic()
+            break
     if not res.get("segments"):
         raise RuntimeError(
             f"mlx whisper 返回空结果（模型异常或音频不可识别）: {DEFAULT_MLX_WHISPER_MODEL}"
@@ -607,10 +659,6 @@ def _do_transcribe(body: bytes, suffix: str, language: Optional[str] = "ja"):
 @app.post("/v1/transcribe")
 @app.post("/v1/stt")
 async def transcribe(request: Request, language: Optional[str] = "ja"):
-    if STT_STATE != "on":
-        raise HTTPException(
-            status_code=503, detail=f"STT is {STT_STATE}; enable it with POST /v1/services/stt/on"
-        )
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="request body is empty")
