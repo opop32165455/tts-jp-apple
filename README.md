@@ -94,11 +94,23 @@ curl -X POST "http://127.0.0.1:7790/v1/transcribe?language=ja" \
 
 ### `GET /health`
 
-模型加载完成前返回 `503`，加载完成后返回：
+TTS 模型加载期间返回 `503`，其他时候返回各引擎的状态（`on` / `loading` / `off`）：
 
 ```json
-{ "status": "ok", "service": "speech_server", "model_load_seconds": 3.42, "lang_code": "japanese" }
+{ "status": "ok", "service": "speech_server", "lang_code": "japanese",
+  "tts": "on", "stt": "off", "model_load_seconds": 3.42, "stt_load_seconds": 0.0 }
 ```
+
+### `GET /v1/services`、`POST /v1/services/{tts|stt}/{on|off}` — 引擎开关
+
+TTS 和 STT 可以在运行中单独加载或卸载，不用重启进程。卸载后模型占用的内存会被释放，此时再调用对应接口会返回 `503`。返回值和 `/health` 里的引擎字段一致。
+
+```bash
+curl -X POST http://127.0.0.1:7790/v1/services/stt/on    # 加载 Whisper（首次需要下载模型）
+curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 卸载 Whisper，释放内存
+```
+
+开关状态不会保存：服务重启后恢复成 `SPEECH_SERVER_TTS_ENABLED` / `SPEECH_SERVER_STT_ENABLED` 设定的值（默认 TTS 开、STT 关）。
 
 ### `GET /v1/config`
 
@@ -121,6 +133,8 @@ curl -X POST "http://127.0.0.1:7790/v1/transcribe?language=ja" \
 返回 `audio/wav`。响应头 `X-TTS-Ref-Audio` 是实际使用的参考音频路径。
 
 ### `POST /v1/transcribe`（别名 `/v1/stt`）— 语音识别
+
+STT 默认是关闭的，需要先执行 `POST /v1/services/stt/on`（或在菜单栏里打开），否则返回 `503`。
 
 - Query 参数：`language`（例如 `ja`、`zh`、`en`）
 - 请求体：音频二进制（WAV / MP3 / M4A / OGG / FLAC / WebM）
@@ -147,6 +161,8 @@ curl -X POST "http://127.0.0.1:7790/v1/transcribe?language=ja" \
 | `SPEECH_SERVER_REPETITION_PENALTY` | `1.1` | 重复惩罚 |
 | `SPEECH_SERVER_MAX_TOKENS` | `512` | 默认最大 token 数 |
 | `SPEECH_SERVER_MLX_WHISPER_MODEL` | `mlx-community/whisper-large-v3-turbo` | STT 模型 |
+| `SPEECH_SERVER_TTS_ENABLED` | `1` | 启动时是否加载 TTS |
+| `SPEECH_SERVER_STT_ENABLED` | `0` | 启动时是否加载 STT（很少用，所以默认不加载） |
 
 旧的 `YUNA_TTS_*` 同名变量仍然兼容。
 
@@ -172,8 +188,12 @@ curl -X POST "http://127.0.0.1:7790/v1/transcribe?language=ja" \
 
 `tools/swiftbar/speech-server.10s.sh` 是一个 [SwiftBar](https://github.com/swiftbar/SwiftBar) 插件，每 10 秒刷新一次。它在菜单栏显示服务状态，并提供启动 / 停止 / 重启、查看日志等操作：
 
-- 🟢 运行中（`/health` 正常），🟠 启动中或模型加载中，🔴 异常退出（launchd 正在重启），⚪ 已停止或未安装
-- 下拉菜单：PID / 端口 / 语言 / 模型加载耗时，启动 / 停止 / 重启（调用 `manage_service.sh`），实时日志，在控制台打开日志，`/v1/config`，打开项目目录
+- 🟢 运行中且 TTS 已开启，🔵 进程在运行但 TTS 已关闭，🟠 启动中或模型加载中，🔴 异常退出（launchd 正在重启），⚪ 已停止或未安装
+- 下拉菜单：
+  - PID / 端口 / 语言
+  - **TTS / STT 开关**：已开启的显示 ✓，点击即可加载或卸载对应模型（调用 `/v1/services`）
+  - 启动 / 停止 / 重启（调用 `manage_service.sh`）
+  - 实时日志、在控制台打开日志、`/v1/config`、打开项目目录
 
 ```bash
 brew install --cask swiftbar
@@ -246,6 +266,7 @@ tts-jp-apple/
 - **开头的“噗”声**：声码器第一帧会产生直流冲击。服务端对输出加了 20 ms 线性淡入，客户端不需要再处理。
 - **短文本重复发音**：Qwen3-TTS 合成极短文本时，如果 `max_tokens` 过大，容易反复读同一个音。调用方没有传 `max_tokens` 且文本 ≤ 20 字时，服务会把它限制为 `max(32, min(默认值, 字数 × 8))`。生成的音频短于 0.3 秒会被当作截断，直接报错。
 - **并发**：`MODEL.generate()` 不是线程安全的，所有合成请求都会串行执行。每次请求结束后会清理 MLX 缓存（上限 2 GB），并执行 GC。
+- **STT 默认关闭**：Whisper 很少用，启动时不加载，需要时在菜单栏或用 `/v1/services/stt/on` 打开。关闭时，依赖 `/v1/transcribe` 的调用方会收到 `503`。
 - **STT 只用 MLX**：`mlx-whisper` 在 Apple Silicon 上比 CPU 版快 4~5 倍（4.5 分钟音频约 11 秒），日语识别也更准，时间戳不容易漂移，所以没有设计 CPU 回退。MLX 出错时会直接报错，不会悄悄降级。第一次调用要加载模型，大约需要 20 秒。
 - **STT 后处理**：用词级时间戳收紧每段的起止时间，丢掉短于 0.2 秒的段，并对重叠的段去重、重新排序。
 - **端口冲突**：先 `./manage_service.sh stop`，或者用 `SPEECH_SERVER_PORT` / `--port` 换一个端口。

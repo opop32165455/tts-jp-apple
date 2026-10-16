@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # <xbar.title>Speech Server</xbar.title>
-# <xbar.desc>Status and start/stop/restart for the local TTS + STT launchd service.</xbar.desc>
+# <xbar.desc>Status, start/stop/restart and TTS/STT engine switches for the local speech launchd service.</xbar.desc>
 # <xbar.dependencies>bash,curl</xbar.dependencies>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
@@ -43,7 +43,9 @@ if [[ ! -f "$PLIST" ]]; then
 elif [[ -z "$launchd_line" ]]; then
   state="stopped"; color="#8E8E93"; text="已停止"
 elif [[ "$health_code" == "200" ]]; then
-  state="running"; color="#34C759"; text="运行中"
+  state="running"; text="运行中"
+  # Icon follows TTS (the engine in daily use): green on, blue = process up but TTS off.
+  [[ "$(json_field tts)" == "on" ]] && color="#34C759" || color="#0A84FF"
 elif [[ "$pid" == "-" ]]; then
   state="crashed"; color="#FF3B30"; text="异常退出（exit $last_exit），launchd 正在重启"
 else
@@ -54,13 +56,28 @@ action() { # label, manage_service.sh subcommand
   echo "$1 | bash=$MANAGE param1=$2 terminal=false refresh=true"
 }
 
+engine_item() { # engine (tts|stt), display name
+  local st load
+  st="$(json_field "$1")"
+  if [[ "$1" == "tts" ]]; then load="$(json_field model_load_seconds)"; else load="$(json_field stt_load_seconds)"; fi
+  case "$st" in
+    on)      echo "$2（已加载 ${load}s，点击关闭） | checked=true bash=/usr/bin/curl param1=-s param2=-m param3=300 param4=-X param5=POST param6=$BASE_URL/v1/services/$1/off terminal=false refresh=true" ;;
+    loading) echo "$2（加载中…） | color=#FF9F0A" ;;
+    *)       echo "$2（未加载，点击开启） | bash=/usr/bin/curl param1=-s param2=-m param3=300 param4=-X param5=POST param6=$BASE_URL/v1/services/$1/on terminal=false refresh=true" ;;
+  esac
+}
+
 # Palette rendering so the menu bar icon keeps its status color (plain sfcolor is drawn as a template).
 sfconfig="$(printf '{"renderingMode":"Palette","colors":["#FFFFFF","%s"]}' "$color" | /usr/bin/base64)"
 echo "| sfimage=waveform.circle.fill sfconfig=$sfconfig"
 echo "---"
 echo "Speech Server：$text | color=$color"
 if [[ "$state" == "running" ]]; then
-  echo "PID $pid · 端口 $PORT · 语言 $(json_field lang_code) · 模型加载 $(json_field model_load_seconds)s | size=12"
+  echo "PID $pid · 端口 $PORT · 语言 $(json_field lang_code) | size=12"
+  echo "---"
+  engine_item tts "TTS 语音合成"
+  engine_item stt "STT 语音识别"
+  echo "引擎开关在服务重启后恢复默认（TTS 开、STT 关） | size=11 color=#8E8E93"
 elif [[ -n "$pid" && "$pid" != "-" ]]; then
   echo "PID $pid · 端口 $PORT | size=12"
 fi

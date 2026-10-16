@@ -112,6 +112,19 @@ DEFAULT_MLX_WHISPER_MODEL = os.environ.get(
 )
 
 
+def _env_flag(name: str, legacy: str, default: bool) -> bool:
+    value = os.environ.get(name, os.environ.get(legacy))
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# 启动时各引擎是否加载；运行中可用 POST /v1/services/{tts|stt}/{on|off} 切换（重启后恢复为这里的值）。
+# STT 很少用，默认不加载，省下 Whisper 的内存。
+DEFAULT_TTS_ENABLED = _env_flag("SPEECH_SERVER_TTS_ENABLED", "YUNA_TTS_TTS_ENABLED", True)
+DEFAULT_STT_ENABLED = _env_flag("SPEECH_SERVER_STT_ENABLED", "YUNA_TTS_STT_ENABLED", False)
+
+
 # ==========================================
 # Logging Configuration (Daily Rotating)
 # ==========================================
@@ -159,6 +172,14 @@ logger = setup_logging()
 MODEL = None
 MODEL_LOCK = threading.Lock()
 MODEL_LOAD_TIME = 0.0
+
+# Engine state: "off" | "loading" | "on". SERVICE_LOCK serializes on/off switching;
+# STT_LOCK keeps the Whisper model from being unloaded mid-transcription.
+SERVICE_LOCK = threading.Lock()
+STT_LOCK = threading.Lock()
+TTS_STATE = "off"
+STT_STATE = "off"
+STT_LOAD_TIME = 0.0
 
 
 class TTSRequest(BaseModel):
@@ -304,11 +325,73 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
             pass
 
 
+def _release_mlx_memory():
+    import gc
+
+    gc.collect()
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+def set_tts_enabled(enabled: bool):
+    global MODEL, MODEL_LOAD_TIME, TTS_STATE
+    with SERVICE_LOCK:
+        if enabled and TTS_STATE != "on":
+            TTS_STATE = "loading"
+            logger.info(f"Loading TTS model from: {DEFAULT_MODEL}")
+            started = time.time()
+            try:
+                model = load_model(DEFAULT_MODEL)
+            except Exception:
+                TTS_STATE = "off"
+                raise
+            with MODEL_LOCK:
+                MODEL = model
+            MODEL_LOAD_TIME = time.time() - started
+            TTS_STATE = "on"
+            logger.info(f"TTS Model loaded successfully in {MODEL_LOAD_TIME:.2f}s")
+        elif not enabled and TTS_STATE != "off":
+            with MODEL_LOCK:  # waits for an in-flight synthesis to finish
+                MODEL = None
+            TTS_STATE = "off"
+            _release_mlx_memory()
+            logger.info("TTS model unloaded")
+
+
+def set_stt_enabled(enabled: bool):
+    global STT_STATE, STT_LOAD_TIME
+    import mlx.core as mx
+    from mlx_whisper.transcribe import ModelHolder
+
+    with SERVICE_LOCK:
+        if enabled and STT_STATE != "on":
+            STT_STATE = "loading"
+            logger.info(f"Loading Whisper model: {DEFAULT_MLX_WHISPER_MODEL}")
+            started = time.time()
+            try:
+                # Same cache and dtype that mlx_whisper.transcribe() uses (fp16 default).
+                ModelHolder.get_model(DEFAULT_MLX_WHISPER_MODEL, mx.float16)
+            except Exception:
+                STT_STATE = "off"
+                raise
+            STT_LOAD_TIME = time.time() - started
+            STT_STATE = "on"
+            logger.info(f"Whisper model loaded in {STT_LOAD_TIME:.2f}s")
+        elif not enabled and STT_STATE != "off":
+            with STT_LOCK:  # waits for an in-flight transcription to finish
+                ModelHolder.model = None
+                ModelHolder.model_path = None
+            STT_STATE = "off"
+            _release_mlx_memory()
+            logger.info("Whisper model unloaded")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global MODEL, MODEL_LOAD_TIME
-    started = time.time()
-    logger.info(f"Loading TTS model from: {DEFAULT_MODEL}")
     patch_transformers_tokenizer_loader()
     try:
         import mlx.core as mx
@@ -316,9 +399,8 @@ async def lifespan(app: FastAPI):
         mx.set_cache_limit(2 * 1024 * 1024 * 1024)
     except Exception:
         pass
-    MODEL = load_model(DEFAULT_MODEL)
-    MODEL_LOAD_TIME = time.time() - started
-    logger.info(f"TTS Model loaded successfully in {MODEL_LOAD_TIME:.2f}s")
+    set_tts_enabled(DEFAULT_TTS_ENABLED)
+    set_stt_enabled(DEFAULT_STT_ENABLED)
     yield
 
 
@@ -330,16 +412,43 @@ app = FastAPI(
 )
 
 
+def _services_status() -> dict:
+    return {
+        "tts": TTS_STATE,
+        "stt": STT_STATE,
+        "model_load_seconds": round(MODEL_LOAD_TIME, 3),
+        "stt_load_seconds": round(STT_LOAD_TIME, 3),
+    }
+
+
 @app.get("/health")
 async def health():
-    if MODEL is None:
+    if TTS_STATE == "loading":
         return JSONResponse(status_code=503, content={"status": "starting"})
     return {
         "status": "ok",
         "service": "speech_server",
-        "model_load_seconds": round(MODEL_LOAD_TIME, 3),
         "lang_code": DEFAULT_LANG,
+        **_services_status(),
     }
+
+
+@app.get("/v1/services")
+async def get_services():
+    return _services_status()
+
+
+@app.post("/v1/services/{name}/{action}")
+def switch_service(name: str, action: str):
+    setters = {"tts": set_tts_enabled, "stt": set_stt_enabled}
+    if name not in setters or action not in ("on", "off"):
+        raise HTTPException(status_code=404, detail="use /v1/services/{tts|stt}/{on|off}")
+    try:
+        setters[name](action == "on")
+    except Exception as exc:
+        logger.error(f"[SERVICE ERROR] {name} {action} failed: {exc!r}")
+        raise HTTPException(status_code=500, detail=f"{name} {action} failed: {exc}") from exc
+    return _services_status()
 
 
 @app.get("/v1/config")
@@ -362,6 +471,10 @@ async def get_config():
 
 @app.post("/v1/tts")
 def tts(request: TTSRequest):
+    if TTS_STATE != "on":
+        raise HTTPException(
+            status_code=503, detail=f"TTS is {TTS_STATE}; enable it with POST /v1/services/tts/on"
+        )
     try:
         wav, ref_audio, ref_text = synthesize_wav_bytes(request)
     except ValueError as exc:
@@ -411,15 +524,19 @@ def _run_whisper(tmp_path: str, language: Optional[str]) -> dict:
     """
     import mlx_whisper
 
-    res = mlx_whisper.transcribe(
-        tmp_path,
-        path_or_hf_repo=DEFAULT_MLX_WHISPER_MODEL,
-        language=language,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-        temperature=0.0,
-        verbose=False,
-    )
+    with STT_LOCK:
+        if STT_STATE != "on":
+            # Checked again under the lock so a concurrent unload can't race us into a reload.
+            raise RuntimeError(f"STT is {STT_STATE}")
+        res = mlx_whisper.transcribe(
+            tmp_path,
+            path_or_hf_repo=DEFAULT_MLX_WHISPER_MODEL,
+            language=language,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            temperature=0.0,
+            verbose=False,
+        )
     if not res.get("segments"):
         raise RuntimeError(
             f"mlx whisper 返回空结果（模型异常或音频不可识别）: {DEFAULT_MLX_WHISPER_MODEL}"
@@ -490,6 +607,10 @@ def _do_transcribe(body: bytes, suffix: str, language: Optional[str] = "ja"):
 @app.post("/v1/transcribe")
 @app.post("/v1/stt")
 async def transcribe(request: Request, language: Optional[str] = "ja"):
+    if STT_STATE != "on":
+        raise HTTPException(
+            status_code=503, detail=f"STT is {STT_STATE}; enable it with POST /v1/services/stt/on"
+        )
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="request body is empty")
