@@ -14,8 +14,20 @@ voices/*
 outputs/*
 !outputs/.gitkeep
 
+# Logs
+logs/
+
 # System files
 .DS_Store
 __pycache__/
 *.pyc
 *.pyo
+
+# Private assets (kept local only, not published)
+ref-audio/*
+!ref-audio/.gitkeep
+data/*
+!data/.gitkeep
+legacy/
+scripts/regenerate_grammar_example_audios.py
+CLAUDE.local.md
