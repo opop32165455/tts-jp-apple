@@ -207,7 +207,10 @@ tts-jp-apple/
 ├── main.py               # 交互式终端应用（上游）
 ├── scripts/
 │   └── run_yuna_demo.py  # 离线批量克隆
+├── AGENTS.md             # AI 编码助手的规则与文档路由（CLAUDE.md 引用它）
 ├── docs/
+│   ├── architecture.md   # 内部实现细节
+│   ├── agent-facts.md    # 环境踩坑记录
 │   └── UPSTREAM.md       # 上游版本跟进说明
 ├── requirements.txt
 ├── models/               # MLX 模型权重（不纳入 git）
