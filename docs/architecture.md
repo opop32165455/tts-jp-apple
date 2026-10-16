@@ -6,7 +6,7 @@ FastAPI app, default `127.0.0.1:7790`. Config is module-level constants read fro
 
 ### Lifecycle
 
-- `lifespan`: patches the tokenizer loader, sets `mx.set_cache_limit(2 GB)`, then applies `DEFAULT_TTS_ENABLED` (default on) / `DEFAULT_STT_ENABLED` (default off).
+- `lifespan`: patches the tokenizer loader, sets `mx.set_cache_limit(2 GB)` and `mx.set_wired_limit(WIRED_LIMIT_MB)` (default 3072; pins weights so macOS can't swap them out — see agent-facts), then applies `DEFAULT_TTS_ENABLED` (default on) / `DEFAULT_STT_ENABLED` (default off).
 - Engine switches: `set_tts_enabled` / `set_stt_enabled`, exposed as `POST /v1/services/{tts|stt}/{on|off}`; state `TTS_STATE` / `STT_STATE` is `off | loading | on`, not persisted (restart → env defaults). `SERVICE_LOCK` serializes switching. TTS unload takes `MODEL_LOCK`; STT unload takes `STT_LOCK` (held during each transcription) and clears `mlx_whisper.transcribe.ModelHolder` (the library's own model cache; preload uses the same fp16 dtype). Both then `gc.collect()` + `mx.clear_cache()`.
 - STT is on-demand: `_run_whisper` calls `set_stt_enabled(True)` when not loaded, then re-checks under `STT_LOCK` and retries if an unload slipped in. `_stt_idle_watcher` (asyncio task, every 30 s) calls `unload_stt_if_idle` after `STT_IDLE_UNLOAD_SECONDS` (default 600, 0 = never) since `STT_LAST_USED`. Lock order is always `SERVICE_LOCK` → `STT_LOCK`; never load while holding `STT_LOCK` (deadlock).
 - `/health` returns 503 only while TTS is `loading`; otherwise 200 with engine states. `/v1/tts` returns 503 when TTS is not `on`; `/v1/transcribe` never rejects for STT state.

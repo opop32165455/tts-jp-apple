@@ -124,6 +124,12 @@ def _env_flag(name: str, legacy: str, default: bool) -> bool:
 # 省下 Whisper 约 1.5~2 GB 内存。
 DEFAULT_TTS_ENABLED = _env_flag("SPEECH_SERVER_TTS_ENABLED", "YUNA_TTS_TTS_ENABLED", True)
 DEFAULT_STT_ENABLED = _env_flag("SPEECH_SERVER_STT_ENABLED", "YUNA_TTS_STT_ENABLED", False)
+# MLX 默认不锁定内存（wired limit = 0），内存紧张时 macOS 会把闲置的模型权重换出到交换区，
+# 久未调用后的第一次合成要先读回 ~2.7 GB，会慢到 6~15 s。设置后模型权重被锁定（wired），不会被换出。
+# 实测这不是硬上限：STT 加载时也会被锁定（约 +2 GB），STT 空闲自动卸载后释放。0 = 不锁定。
+WIRED_LIMIT_MB = int(
+    os.environ.get("SPEECH_SERVER_WIRED_LIMIT_MB", os.environ.get("YUNA_TTS_WIRED_LIMIT_MB", "3072"))
+)
 STT_IDLE_UNLOAD_SECONDS = int(
     os.environ.get(
         "SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS",
@@ -433,8 +439,11 @@ async def lifespan(app: FastAPI):
         import mlx.core as mx
 
         mx.set_cache_limit(2 * 1024 * 1024 * 1024)
-    except Exception:
-        pass
+        if WIRED_LIMIT_MB > 0:
+            mx.set_wired_limit(WIRED_LIMIT_MB * 1024 * 1024)
+            logger.info(f"MLX wired limit set to {WIRED_LIMIT_MB} MB")
+    except Exception as exc:
+        logger.warning(f"MLX memory limits not applied: {exc!r}")
     set_tts_enabled(DEFAULT_TTS_ENABLED)
     set_stt_enabled(DEFAULT_STT_ENABLED)
     watcher = asyncio.create_task(_stt_idle_watcher()) if STT_IDLE_UNLOAD_SECONDS > 0 else None
