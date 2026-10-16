@@ -9,3 +9,4 @@ Verified environment facts and pitfalls. Add new ones here.
 - **STT fails with ffmpeg not found**: mlx-whisper shells out to `ffmpeg`; the server symlinks imageio-ffmpeg's versioned binary to `.venv/bin/ffmpeg` at startup. Check that `imageio-ffmpeg` is installed or `brew install ffmpeg`.
 - **Tokenizer load error**: transformers 5.0.0rc3 needs `fix_mistral_regex=True` for the Qwen tokenizer; handled by `patch_transformers_tokenizer_loader()`.
 - **Git push "did not receive expected object"**: repo was a shallow clone; `git fetch --unshallow upstream` fixed it.
+- **SwiftBar icon color**: `sfcolor` is drawn as a template (white). Use `sfconfig` (base64 JSON, `renderingMode: Palette`, two colors: glyph then circle). SwiftBar runs plugins with a minimal PATH; use absolute binary paths. Refresh manually: `open -g swiftbar://refreshallplugins`.

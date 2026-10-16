@@ -13,6 +13,7 @@ Read only this file, then the one matching row below, then the code. Do not prel
 | `speech_server.py`: TTS/STT behavior, post-processing, concurrency, config | `docs/architecture.md` |
 | `scripts/run_yuna_demo.py` batch generation | `docs/architecture.md` §Batch script |
 | launchd / ports / ffmpeg / env setup problems | `docs/agent-facts.md` |
+| Menu bar plugin `tools/swiftbar/` | the script itself + README §菜单栏管理 |
 | Sync upstream, git remotes, publishing | `docs/UPSTREAM.md` |
 | API shape, env var list, user docs | `README.md` (the matching section only) |
 

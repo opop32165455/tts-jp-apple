@@ -168,6 +168,23 @@ curl -X POST "http://127.0.0.1:7790/v1/transcribe?language=ja" \
 - launchd 自身的 stdout/stderr：`~/Library/Logs/speech-server/`
 - 服务运行时会占用 7790 端口和模型内存。要在前台调试，先执行 `./manage_service.sh stop`
 
+### 菜单栏管理（SwiftBar）
+
+`tools/swiftbar/speech-server.10s.sh` 是一个 [SwiftBar](https://github.com/swiftbar/SwiftBar) 插件，每 10 秒刷新一次。它在菜单栏显示服务状态，并提供启动 / 停止 / 重启、查看日志等操作：
+
+- 🟢 运行中（`/health` 正常），🟠 启动中或模型加载中，🔴 异常退出（launchd 正在重启），⚪ 已停止或未安装
+- 下拉菜单：PID / 端口 / 语言 / 模型加载耗时，启动 / 停止 / 重启（调用 `manage_service.sh`），实时日志，在控制台打开日志，`/v1/config`，打开项目目录
+
+```bash
+brew install --cask swiftbar
+PLUG="$HOME/Library/Application Support/SwiftBar/Plugins"
+mkdir -p "$PLUG" && ln -sf "$PWD/tools/swiftbar/speech-server.10s.sh" "$PLUG/"
+defaults write com.ameba.SwiftBar PluginDirectory "$PLUG"   # 第一次启动 SwiftBar 前设置；如果已经在用 SwiftBar，就把插件链接到现有的插件目录
+open -a SwiftBar
+```
+
+插件用的是软链接，所以修改仓库里的脚本会直接生效。端口不是 7790 时，在插件里修改 `PORT`。想开机自动显示，在 SwiftBar 设置里打开 Launch at Login。
+
 ---
 
 ## 其他工具
@@ -207,6 +224,7 @@ tts-jp-apple/
 ├── main.py               # 交互式终端应用（上游）
 ├── scripts/
 │   └── run_yuna_demo.py  # 离线批量克隆
+├── tools/swiftbar/       # 菜单栏状态与启停插件
 ├── AGENTS.md             # AI 编码助手的规则与文档路由（CLAUDE.md 引用它）
 ├── docs/
 │   ├── architecture.md   # 内部实现细节
