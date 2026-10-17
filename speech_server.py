@@ -11,6 +11,7 @@ import io
 import logging
 import os
 import re
+import struct
 import sys
 import tempfile
 import threading
@@ -21,9 +22,10 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -227,6 +229,8 @@ class TTSRequest(BaseModel):
     ref_audio: Optional[str] = None
     ref_text: Optional[str] = None
     lang_code: Optional[str] = None
+    streaming_interval: Optional[float] = 0.5
+    format: Optional[str] = "pcm"
 
 
 def patch_transformers_tokenizer_loader():
@@ -383,6 +387,126 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
             gc.collect()
         except Exception:
             pass
+
+
+def _make_wav_header(sample_rate: int = 24000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    data_size = 0x7FFFF000  # Streaming continuous length
+    riff_size = data_size + 36
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", riff_size, b"WAVE",
+        b"fmt ", 16, 1, channels, sample_rate, byte_rate, block_align, bits_per_sample,
+        b"data", data_size,
+    )
+
+
+def stream_audio_generator(req: TTSRequest):
+    raw_text = req.text.strip()
+    if not raw_text:
+        raise ValueError("text is empty")
+
+    normalized = RUBY_PATTERN.sub(r"\2", raw_text)
+    if normalized != raw_text:
+        logger.info(f"[TTS FURIGANA] {raw_text!r} -> {normalized!r}")
+
+    temperature = (
+        req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
+    )
+    top_p = req.top_p if req.top_p is not None else DEFAULT_TOP_P
+    top_k = req.top_k if req.top_k is not None else DEFAULT_TOP_K
+    repetition_penalty = (
+        req.repetition_penalty
+        if req.repetition_penalty is not None
+        else DEFAULT_REPETITION_PENALTY
+    )
+    max_tokens = (
+        req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS
+    )
+    ref_audio = req.ref_audio if req.ref_audio is not None else DEFAULT_REF_AUDIO
+    ref_text = req.ref_text if req.ref_text is not None else DEFAULT_REF_TEXT
+    if ref_text == "":
+        ref_text = None
+    lang_code = req.lang_code if req.lang_code is not None else DEFAULT_LANG
+    streaming_interval = req.streaming_interval if req.streaming_interval is not None else 0.5
+    audio_format = (req.format or "pcm").strip().lower()
+
+    if req.max_tokens is None and len(normalized) <= 20:
+        max_tokens = max(32, min(max_tokens, len(normalized) * 8))
+
+    start_time = time.time()
+    logger.info(
+        f"[TTS STREAM START] text={normalized!r} | interval={streaming_interval}s | format={audio_format} | "
+        f"ref_audio={ref_audio!r} | temp={temperature} | top_p={top_p} | top_k={top_k} | rep_pen={repetition_penalty}"
+    )
+
+    sample_rate = 24000
+    is_first_chunk = True
+    total_samples = 0
+    total_chunks = 0
+
+    try:
+        with MODEL_LOCK:
+            if MODEL is None:
+                raise RuntimeError("model not loaded")
+
+            if audio_format == "wav":
+                yield _make_wav_header(sample_rate=sample_rate)
+
+            for result in MODEL.generate(
+                text=normalized,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                lang_code=lang_code,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                max_tokens=max_tokens,
+                stream=True,
+                streaming_interval=streaming_interval,
+                verbose=False,
+            ):
+                chunk = result.audio
+                if chunk is None or len(chunk) == 0:
+                    continue
+                if not isinstance(chunk, np.ndarray):
+                    chunk = np.array(chunk, dtype=np.float32)
+
+                sample_rate = result.sample_rate
+
+                if is_first_chunk:
+                    fade_len = min(len(chunk), int(sample_rate * 0.02))
+                    if fade_len > 0:
+                        fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                        chunk[:fade_len] = chunk[:fade_len] * fade_in
+                    ttfa = time.time() - start_time
+                    logger.info(f"[TTS STREAM TTFA] first chunk ready in {ttfa*1000:.1f}ms ({len(chunk)} samples)")
+                    is_first_chunk = False
+
+                total_samples += len(chunk)
+                total_chunks += 1
+
+                pcm_data = np.clip(chunk, -1.0, 1.0)
+                pcm_bytes = (pcm_data * 32767.0).astype(np.int16).tobytes()
+                yield pcm_bytes
+
+        elapsed = time.time() - start_time
+        total_dur = total_samples / sample_rate if sample_rate > 0 else 0.0
+        rtf = elapsed / total_dur if total_dur > 0 else 0.0
+        logger.info(
+            f"[TTS STREAM SUCCESS] text={normalized!r} | chunks={total_chunks} | audio_duration={total_dur:.2f}s | "
+            f"synthesis_time={elapsed:.2f}s | rtf={rtf:.2f}x"
+        )
+    except GeneratorExit:
+        logger.info(f"[TTS STREAM CANCEL] client disconnected after {total_chunks} chunks")
+    except Exception as exc:
+        logger.error(f"[TTS STREAM ERROR] text={normalized!r} | error={exc!r}")
+        raise
+    finally:
+        touch_tts()
+        _release_mlx_memory()
 
 
 def _release_mlx_memory():
@@ -699,6 +823,62 @@ def tts(request: TTSRequest):
         "X-TTS-Ref-Text": urllib.parse.quote(ref_text or ""),
     }
     return Response(content=wav, media_type="audio/wav", headers=headers)
+
+
+@app.post("/v1/tts/stream")
+def tts_stream(request: TTSRequest):
+    touch_tts()
+    if TTS_STATE != "on":
+        try:
+            set_tts_enabled(True)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"tts load failed: {exc}") from exc
+
+    fmt = (request.format or "pcm").strip().lower()
+    media_type = "audio/wav" if fmt == "wav" else "audio/pcm"
+    headers = {
+        "X-Sample-Rate": "24000",
+        "X-Channels": "1",
+        "X-Audio-Format": "pcm_s16le",
+        "X-TTS-Ref-Audio": request.ref_audio or DEFAULT_REF_AUDIO,
+        "X-TTS-Ref-Text": urllib.parse.quote(request.ref_text or DEFAULT_REF_TEXT or ""),
+    }
+    try:
+        return StreamingResponse(
+            stream_audio_generator(request),
+            media_type=media_type,
+            headers=headers,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"tts stream failed: {exc}") from exc
+
+
+@app.get("/v1/tts/stream")
+def tts_stream_get(
+    text: str,
+    format: Optional[str] = "pcm",
+    streaming_interval: Optional[float] = 0.5,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    repetition_penalty: Optional[float] = None,
+    ref_audio: Optional[str] = None,
+    lang_code: Optional[str] = None,
+):
+    req = TTSRequest(
+        text=text,
+        format=format,
+        streaming_interval=streaming_interval,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        ref_audio=ref_audio,
+        lang_code=lang_code,
+    )
+    return tts_stream(req)
 
 
 # 注意：原先的 CPU 版 openai-whisper（`get_whisper_model` + `import whisper`）已整体移除，
