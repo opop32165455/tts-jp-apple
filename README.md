@@ -153,6 +153,41 @@ curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 立即卸载，释放
 
 返回 `audio/wav`。响应头 `X-TTS-Ref-Audio` 是实际使用的参考音频路径。
 
+> **注音支持**：支持日语振假名注音语法 `漢字（ふりがな）`（例如 `臥薪嘗胆（がしんしょうたん）` 或 `東海林（しょうじ）さん`），服务端会自动提取括号内的平假名发音，避免大模型把汉字与注音连续朗读两遍。
+
+### `POST /v1/tts/stream`（及 `GET /v1/tts/stream`）— 实时分块流式语音合成
+
+专为低延迟实时交互（如实时对话 AI、数字人播报）设计，模型生成前几十毫秒内首包音频（TTFA ~ 400-700ms）即刻送达，客户端可边接收边播放。
+
+**请求参数（JSON 或 GET Query）**：支持所有 `/v1/tts` 基础参数，外加：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `format` | string | `pcm` | 输出音频格式：`pcm`（裸 16-bit PCM S16LE, 24kHz 单声道，适合 WebRTC/播放器管道）或 `wav`（首包带 44 字节流式 WAV 头，支持浏览器 `<audio>` 或 `ffplay` 直接播放） |
+| `streaming_interval` | float | `0.5` | 分块发送间隔（秒），越小首包延迟越低（推荐 0.5s~0.8s） |
+
+**响应特性**：
+- `Transfer-Encoding: chunked`
+- 响应头：`X-Sample-Rate: 24000`, `X-Channels: 1`, `X-Audio-Format: pcm_s16le`
+
+**快速测试**：
+```bash
+# 1. 命令行实时边流式下载边播放（Mac 自带 ffplay）
+curl -s "http://127.0.0.1:7790/v1/tts/stream?text=こんにちは、今日も一日頑張りましょう。&format=wav" | ffplay -nodisp -autoexit -
+
+# 2. Python 客户端流式接收裸 PCM
+import urllib.request, json
+req = urllib.request.Request(
+    "http://127.0.0.1:7790/v1/tts/stream",
+    data=json.dumps({"text": "こんにちは！", "format": "pcm"}).encode(),
+    headers={"Content-Type": "application/json"}
+)
+with urllib.request.urlopen(req) as resp:
+    while chunk := resp.read(4096):
+        # 喂给音频播放队列（例如 pyaudio / sounddevice / WebAudio）
+        pass
+```
+
 ### `POST /v1/transcribe`（别名 `/v1/stt`）— 语音识别
 
 STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 秒；之后的请求直接使用已加载的模型。
