@@ -98,15 +98,32 @@ TTS 模型加载期间返回 `503`，其他时候返回各引擎的状态（`on`
 
 ```json
 { "status": "ok", "service": "speech_server", "lang_code": "japanese",
-  "tts": "on", "stt": "off", "model_load_seconds": 3.42, "stt_load_seconds": 0.0,
+  "tts": "on", "stt": "off", "tts_idle_unload_seconds": 600, "tts_unload_in_seconds": 412,
+  "tts_error": null, "model_load_seconds": 1.15, "stt_load_seconds": 0.0,
   "stt_idle_unload_seconds": 600, "stt_unload_in_seconds": null }
+```
+
+### `POST /v1/heartbeat` — 客户端心跳
+
+客户端 App 处于活跃状态时定期调用（建议每 1～2 分钟一次，远小于 10 分钟），告诉服务"马上可能要用 TTS"：
+
+- TTS 已加载：只刷新空闲计时，立即返回。
+- TTS 未加载：后台开始加载（约 1～3 秒），接口立即返回 `"ready": false`；加 `?wait=true` 则等加载完成再返回（失败返回 `500`）。
+- 加载后的模型权重锁定在物理内存里（见下文"久未调用后第一次很慢"），不会被换到交换区。
+- 连续 `SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS`（默认 600 秒）既没有心跳也没有 TTS 请求，TTS 模型会被卸载，进程只占约 400 MB。下一次心跳或 TTS 请求会重新加载。
+
+返回值是 `/health` 的引擎字段，外加 `ready`（TTS 是否可以立即合成）：
+
+```bash
+curl -s -X POST http://127.0.0.1:7790/v1/heartbeat
+# {"ready": true, "tts": "on", "tts_unload_in_seconds": 599, ...}
 ```
 
 ### `GET /v1/services`、`POST /v1/services/{tts|stt}/{on|off}` — 引擎开关
 
 TTS 和 STT 可以在运行中单独加载或卸载，不用重启进程，卸载后模型占用的内存会被释放。返回值和 `/health` 里的引擎字段一致。
 
-- **TTS**：常驻内存。手动关闭后，`/v1/tts` 会返回 `503`，直到重新打开。
+- **TTS**：跟随心跳加载和卸载（见上文）。`/v1/tts` 在未加载时会自动加载（这次请求多等约 1～3 秒），每次请求也会刷新空闲计时。`off` 立即卸载，下一次心跳或请求会重新加载。
 - **STT**：按需加载。卸载状态下收到识别请求时会自动加载模型（这次请求要多等约 2 秒），连续空闲 10 分钟（`SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS`）后自动卸载，可以省下约 1.5～2 GB 内存。`on` 用来提前预加载，`off` 用来立即卸载。
 
 ```bash
@@ -114,7 +131,7 @@ curl -X POST http://127.0.0.1:7790/v1/services/stt/on    # 预加载 Whisper（�
 curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 立即卸载，释放内存
 ```
 
-开关状态不会保存：服务重启后恢复成环境变量设定的值（默认 TTS 开，STT 不预加载）。
+开关状态不会保存：服务重启后恢复成环境变量设定的值（默认启动时加载 TTS，之后没有心跳的话 10 分钟后卸载；STT 不预加载）。
 
 ### `GET /v1/config`
 
@@ -167,6 +184,7 @@ STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 �
 | `SPEECH_SERVER_MLX_WHISPER_MODEL` | `mlx-community/whisper-large-v3-turbo` | STT 模型 |
 | `SPEECH_SERVER_TTS_ENABLED` | `1` | 启动时是否加载 TTS |
 | `SPEECH_SERVER_STT_ENABLED` | `0` | 启动时是否预加载 STT（不预加载时，调用时会自动加载） |
+| `SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS` | `600` | 多少秒没有心跳和 TTS 请求就卸载 TTS，`0` 表示常驻不卸载 |
 | `SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS` | `600` | STT 空闲多少秒后自动卸载，`0` 表示不卸载 |
 | `SPEECH_SERVER_FAST_TTS` | `1` | 使用编译优化的生成循环（`qwen3_fast.py`，音质不变，约快 15～20%），`0` 表示使用 mlx-audio 原版 |
 | `SPEECH_SERVER_WIRED_LIMIT_MB` | `3072` | 把模型权重锁定在内存里，防止被系统换出（见下文），`0` 表示不锁定 |
@@ -198,7 +216,7 @@ STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 �
 - 🟢 运行中且 TTS 已开启，🔵 进程在运行但 TTS 已关闭，🟠 启动中或模型加载中，🔴 异常退出（launchd 正在重启），⚪ 已停止或未安装
 - 下拉菜单：
   - PID / 端口 / 语言
-  - **TTS / STT 开关**：已加载的显示 ✓，点击即可加载或卸载对应模型（调用 `/v1/services`）。STT 加载后还会显示多久后自动卸载
+  - **TTS / STT 开关**：已加载的显示 ✓，点击即可加载或卸载对应模型（调用 `/v1/services`）。已加载的引擎还会显示多久后自动卸载
   - 启动 / 停止 / 重启（调用 `manage_service.sh`）
   - 实时日志、在控制台打开日志、`/v1/config`、打开项目目录
 
@@ -250,9 +268,11 @@ tts-jp-apple/
 ├── manage_service.sh     # launchd 服务管理
 ├── main.py               # 交互式终端应用（上游）
 ├── qwen3_fast.py         # 编译优化的 Qwen3-TTS 生成循环（与原版逐位一致）
+├── mlx_fixes.py          # MLX bug 的绕过（转置卷积分块计算，修复开头漏读）
 ├── scripts/
 │   ├── run_yuna_demo.py  # 离线批量克隆
-│   └── check_fast_tts.py # 校验 qwen3_fast 与原版逐位一致并对比速度
+│   ├── check_fast_tts.py # 校验 qwen3_fast 与原版逐位一致并对比速度
+│   └── check_mlx_fixes.py # 校验 mlx_fixes 与 CPU 结果一致、MLX bug 是否还在
 ├── tools/swiftbar/       # 菜单栏状态与启停插件
 ├── AGENTS.md             # AI 编码助手的规则与文档路由（CLAUDE.md 引用它）
 ├── docs/
@@ -275,6 +295,7 @@ tts-jp-apple/
 - **开头的“噗”声**：声码器第一帧会产生直流冲击。服务端对输出加了 20 ms 线性淡入，客户端不需要再处理。
 - **久未调用后第一次很慢**：内存紧张时，macOS 会把闲置进程的内存换出到交换区。MLX 默认不锁定模型内存，所以闲置的 TTS 权重（约 2.7 GB）会被换出，下一次调用要先把它读回来。实测这种情况要 6.5 秒，日志里空闲 1 小时以上后的第一次调用中位数是 13 秒（平时约 2 秒）。服务启动时会调用 `mx.set_wired_limit` 把模型锁定在内存里，从而避免这个问题。代价是这部分内存（TTS 约 2.7 GB；STT 加载期间另外约 2 GB）一直占着，不能被系统挪给其他程序。
 - **合成提速（`qwen3_fast.py`）**：每个 token 要跑 1 次主模型（约 16 ms，受内存带宽限制）和 15 次 code predictor 小模型（约 20 ms，主要是大量小 kernel 的开销）。`qwen3_fast.py` 用 `mx.compile` 把每个 token 的 15 步 code predictor 编译成一张计算图，并去掉了每步都清空 MLX 缓存的操作。权重、算法和采样都没变：同一个随机种子下，输出和 mlx-audio 原版逐位相同。20 假名的句子从约 1.8 秒降到约 1.5 秒。服务启动时会先预热约 2 秒，完成编译。升级 mlx / mlx-audio 后，需要运行 `.venv/bin/python scripts/check_fast_tts.py` 确认输出仍然逐位相同；如果不一致，先设置 `SPEECH_SERVER_FAST_TTS=0`。
+- **句子开头漏读（已修复）**：MLX 0.30.3 的 Metal `conv_transpose1d` 有个 bug：输出长度超过约 32768 时，开头那段结果会出错。声码器最后一层上采样输出的是 24 kHz 音频，所以所有长于约 1.36 秒的音频，开头都会变成静音或杂音，听起来像是“漏读了开头几个字”，和模型本身、文本写法都无关。`mlx_fixes.py` 把这个算子改成分块计算，结果和 CPU 一致，每次解码只多约 15 ms。升级 mlx 后需要运行 `.venv/bin/python scripts/check_mlx_fixes.py` 确认修复仍然有效。**修复前生成的音频，开头很可能已经受损**，需要的话请重新生成。
 - **短文本重复发音**：Qwen3-TTS 合成极短文本时，如果 `max_tokens` 过大，容易反复读同一个音。调用方没有传 `max_tokens` 且文本 ≤ 20 字时，服务会把它限制为 `max(32, min(默认值, 字数 × 8))`。生成的音频短于 0.3 秒会被当作截断，直接报错。
 - **并发**：`MODEL.generate()` 不是线程安全的，所有合成请求都会串行执行。每次请求结束后会清理 MLX 缓存（上限 2 GB），并执行 GC。
 - **STT 按需加载**：Whisper 很少用，所以启动时不加载，收到第一个识别请求时才加载，空闲 10 分钟后自动卸载。调用方不需要做任何改动，只是加载后的第一个请求会慢约 2 秒。

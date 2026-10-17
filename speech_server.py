@@ -52,7 +52,10 @@ except Exception:
 
 from mlx_audio.tts.utils import load_model
 
+import mlx_fixes
 import qwen3_fast
+
+mlx_fixes.apply()  # MLX Metal conv_transpose1d bug truncated the start of every clip > ~1.36 s
 
 # Environment Configurations (with backward compatibility)
 DEFAULT_HOST = os.environ.get(
@@ -134,6 +137,14 @@ WIRED_LIMIT_MB = int(
 )
 # 用 qwen3_fast 的编译版生成循环（同种子下与 mlx-audio 原版逐位一致，约快 15%）；0 = 用原版 Model.generate。
 FAST_TTS = _env_flag("SPEECH_SERVER_FAST_TTS", "YUNA_TTS_FAST_TTS", True)
+# TTS 跟着客户端心跳走：POST /v1/heartbeat（或 TTS 请求）会加载并保持 TTS，
+# 超过这么多秒没有心跳/请求就卸载模型、释放内存（0 = 常驻不卸载）。
+TTS_IDLE_UNLOAD_SECONDS = int(
+    os.environ.get(
+        "SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS",
+        os.environ.get("YUNA_TTS_TTS_IDLE_UNLOAD_SECONDS", "600"),
+    )
+)
 STT_IDLE_UNLOAD_SECONDS = int(
     os.environ.get(
         "SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS",
@@ -199,6 +210,10 @@ TTS_STATE = "off"
 STT_STATE = "off"
 STT_LOAD_TIME = 0.0
 STT_LAST_USED = 0.0  # time.monotonic() of the last load or transcription
+TTS_LAST_ACTIVE = 0.0  # time.monotonic() of the last heartbeat, TTS request or load
+TTS_LAST_ERROR: Optional[str] = None  # last background load failure, cleared on success
+_TTS_LOADER: Optional[threading.Thread] = None
+_TTS_LOADER_LOCK = threading.Lock()
 
 
 class TTSRequest(BaseModel):
@@ -276,6 +291,7 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
         with MODEL_LOCK:
             if MODEL is None:
                 raise RuntimeError("model not loaded")
+
             result_count = 0
             audio = None
             sample_rate = None
@@ -395,8 +411,24 @@ def _warm_up_tts():
         _release_mlx_memory()
 
 
+def touch_tts():
+    """Mark TTS as in use; postpones the idle unload."""
+    global TTS_LAST_ACTIVE
+    TTS_LAST_ACTIVE = time.monotonic()
+
+
+def _unload_tts_locked():
+    """Caller holds SERVICE_LOCK."""
+    global MODEL, TTS_STATE
+    with MODEL_LOCK:  # waits for an in-flight synthesis to finish
+        MODEL = None
+        qwen3_fast.reset()
+    TTS_STATE = "off"
+    _release_mlx_memory()
+
+
 def set_tts_enabled(enabled: bool):
-    global MODEL, MODEL_LOAD_TIME, TTS_STATE
+    global MODEL, MODEL_LOAD_TIME, TTS_STATE, TTS_LAST_ERROR
     with SERVICE_LOCK:
         if enabled and TTS_STATE != "on":
             TTS_STATE = "loading"
@@ -404,21 +436,46 @@ def set_tts_enabled(enabled: bool):
             started = time.time()
             try:
                 model = load_model(DEFAULT_MODEL)
-            except Exception:
+            except Exception as exc:
                 TTS_STATE = "off"
+                TTS_LAST_ERROR = repr(exc)
                 raise
             with MODEL_LOCK:
                 MODEL = model
             MODEL_LOAD_TIME = time.time() - started
             _warm_up_tts()
             TTS_STATE = "on"
+            TTS_LAST_ERROR = None
+            touch_tts()
             logger.info(f"TTS Model loaded successfully in {MODEL_LOAD_TIME:.2f}s")
         elif not enabled and TTS_STATE != "off":
-            with MODEL_LOCK:  # waits for an in-flight synthesis to finish
-                MODEL = None
-            TTS_STATE = "off"
-            _release_mlx_memory()
+            _unload_tts_locked()
             logger.info("TTS model unloaded")
+
+
+def _load_tts_in_background():
+    try:
+        set_tts_enabled(True)
+    except Exception as exc:
+        logger.error(f"[TTS LOAD ERROR] {exc!r}")
+
+
+def ensure_tts_loading():
+    """Start loading TTS in a background thread if it is off; returns immediately."""
+    global _TTS_LOADER
+    with _TTS_LOADER_LOCK:
+        if TTS_STATE == "on" or (_TTS_LOADER is not None and _TTS_LOADER.is_alive()):
+            return
+        _TTS_LOADER = threading.Thread(target=_load_tts_in_background, name="tts-loader", daemon=True)
+        _TTS_LOADER.start()
+
+
+def unload_tts_if_idle():
+    with SERVICE_LOCK:
+        idle = time.monotonic() - TTS_LAST_ACTIVE
+        if TTS_STATE == "on" and idle >= TTS_IDLE_UNLOAD_SECONDS:
+            _unload_tts_locked()
+            logger.info(f"TTS model unloaded after {idle:.0f}s without heartbeat")
 
 
 def _unload_stt_locked():
@@ -466,10 +523,24 @@ def unload_stt_if_idle():
             logger.info(f"Whisper model unloaded after {idle:.0f}s idle")
 
 
-async def _stt_idle_watcher():
+async def _idle_watcher():
     while True:
         await asyncio.sleep(30)
-        if STT_STATE == "on" and time.monotonic() - STT_LAST_USED >= STT_IDLE_UNLOAD_SECONDS:
+        now = time.monotonic()
+        if (
+            TTS_IDLE_UNLOAD_SECONDS > 0
+            and TTS_STATE == "on"
+            and now - TTS_LAST_ACTIVE >= TTS_IDLE_UNLOAD_SECONDS
+        ):
+            try:
+                await asyncio.to_thread(unload_tts_if_idle)
+            except Exception as exc:
+                logger.error(f"[TTS IDLE UNLOAD ERROR] {exc!r}")
+        if (
+            STT_IDLE_UNLOAD_SECONDS > 0
+            and STT_STATE == "on"
+            and now - STT_LAST_USED >= STT_IDLE_UNLOAD_SECONDS
+        ):
             try:
                 await asyncio.to_thread(unload_stt_if_idle)
             except Exception as exc:
@@ -490,10 +561,9 @@ async def lifespan(app: FastAPI):
         logger.warning(f"MLX memory limits not applied: {exc!r}")
     set_tts_enabled(DEFAULT_TTS_ENABLED)
     set_stt_enabled(DEFAULT_STT_ENABLED)
-    watcher = asyncio.create_task(_stt_idle_watcher()) if STT_IDLE_UNLOAD_SECONDS > 0 else None
+    watcher = asyncio.create_task(_idle_watcher())
     yield
-    if watcher:
-        watcher.cancel()
+    watcher.cancel()
 
 
 app = FastAPI(
@@ -508,6 +578,13 @@ def _services_status() -> dict:
     return {
         "tts": TTS_STATE,
         "stt": STT_STATE,
+        "tts_idle_unload_seconds": TTS_IDLE_UNLOAD_SECONDS,
+        "tts_unload_in_seconds": (
+            max(0, int(TTS_IDLE_UNLOAD_SECONDS - (time.monotonic() - TTS_LAST_ACTIVE)))
+            if TTS_STATE == "on" and TTS_IDLE_UNLOAD_SECONDS > 0
+            else None
+        ),
+        "tts_error": TTS_LAST_ERROR,
         "model_load_seconds": round(MODEL_LOAD_TIME, 3),
         "stt_load_seconds": round(STT_LOAD_TIME, 3),
         "stt_idle_unload_seconds": STT_IDLE_UNLOAD_SECONDS,
@@ -536,11 +613,33 @@ async def get_services():
     return _services_status()
 
 
+@app.post("/v1/heartbeat")
+async def heartbeat(wait: bool = False):
+    """Client is active: keep TTS loaded (wired in RAM) for another TTS_IDLE_UNLOAD_SECONDS.
+
+    Loads TTS in the background when it is off and returns at once; wait=true blocks
+    until it is ready (or the load fails).
+    """
+    touch_tts()
+    if TTS_STATE != "on":
+        if wait:
+            try:
+                await asyncio.to_thread(set_tts_enabled, True)
+            except Exception as exc:
+                logger.error(f"[TTS LOAD ERROR] {exc!r}")
+                raise HTTPException(status_code=500, detail=f"tts load failed: {exc}") from exc
+        else:
+            ensure_tts_loading()
+    return {"ready": TTS_STATE == "on", **_services_status()}
+
+
 @app.post("/v1/services/{name}/{action}")
 def switch_service(name: str, action: str):
     setters = {"tts": set_tts_enabled, "stt": set_stt_enabled}
     if name not in setters or action not in ("on", "off"):
         raise HTTPException(status_code=404, detail="use /v1/services/{tts|stt}/{on|off}")
+    if name == "tts" and action == "on":
+        touch_tts()
     try:
         setters[name](action == "on")
     except Exception as exc:
@@ -569,16 +668,20 @@ async def get_config():
 
 @app.post("/v1/tts")
 def tts(request: TTSRequest):
+    touch_tts()  # before loading, so the idle watcher can't unload in between
     if TTS_STATE != "on":
-        raise HTTPException(
-            status_code=503, detail=f"TTS is {TTS_STATE}; enable it with POST /v1/services/tts/on"
-        )
+        try:
+            set_tts_enabled(True)  # load on demand; waits for an in-progress load
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"tts load failed: {exc}") from exc
     try:
         wav, ref_audio, ref_text = synthesize_wav_bytes(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"tts failed: {exc}") from exc
+    finally:
+        touch_tts()
 
     headers = {
         "X-TTS-Ref-Audio": ref_audio,

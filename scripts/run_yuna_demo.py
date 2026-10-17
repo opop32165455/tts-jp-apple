@@ -5,6 +5,7 @@ import os
 import re
 import time
 from pathlib import Path
+import sys
 
 import numpy as np
 
@@ -14,13 +15,17 @@ os.environ.setdefault("USE_FLAX", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from mlx_audio.audio_io import read as audio_read
 from mlx_audio.audio_io import write as audio_write
 from mlx_audio.tts.utils import load_model
 
+import mlx_fixes
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
+mlx_fixes.apply()  # MLX Metal conv_transpose1d bug truncated the start of every clip > ~1.36 s
 
 # 输入数据集与参考音频默认放在项目内 data/ 与 ref-audio/（不纳入 git，需自行放置），也可用参数指定。
 DEFAULT_CSV = str(PROJECT_ROOT / "data" / "yuna-missing-audio.csv")

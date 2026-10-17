@@ -27,6 +27,7 @@ New verified facts or pitfalls go into `docs/agent-facts.md`, not into private a
 - `patch_transformers_tokenizer_loader()` exists in both `speech_server.py` and `scripts/run_yuna_demo.py`; change both together.
 - Never commit to `upstream-main`. `upstream` remote is fetch-only.
 - `qwen3_fast.py` mirrors mlx-audio internals (pinned commit in `requirements.txt`). After changing mlx / mlx-audio versions or `qwen3_fast.py`, run `.venv/bin/python scripts/check_fast_tts.py`; it must print `PASS: bit-identical`.
+- `mlx_fixes.apply()` must run before any audio decode (server and batch script). After changing the mlx version, run `.venv/bin/python scripts/check_mlx_fixes.py`; it must print `PASS`.
 - Do not modify or run anything in `legacy/`.
 
 ## Verify

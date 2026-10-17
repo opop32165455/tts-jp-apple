@@ -61,22 +61,16 @@ switch_cmd() { # engine, on|off
 }
 
 engine_item() { # engine (tts|stt), display name
-  local st detail unload_in
+  local st detail unload_in idle_hint
   st="$(json_field "$1")"
-  if [[ "$1" == "tts" ]]; then
-    case "$st" in
-      on) detail="已加载，点击关闭" ;;
-      *)  detail="已关闭，点击开启" ;;
-    esac
-  else
-    unload_in="$(json_field stt_unload_in_seconds)"
-    case "$st" in
-      on) [[ "$unload_in" =~ ^[0-9]+$ ]] \
-            && detail="已加载，空闲 $(( (unload_in + 59) / 60 )) 分钟后自动卸载，点击立即卸载" \
-            || detail="已加载，点击卸载" ;;
-      *)  detail="未加载，调用时自动加载，点击预加载" ;;
-    esac
-  fi
+  unload_in="$(json_field "$1_unload_in_seconds")"
+  [[ "$1" == "tts" ]] && idle_hint="无心跳" || idle_hint="空闲"
+  case "$st" in
+    on) [[ "$unload_in" =~ ^[0-9]+$ ]] \
+          && detail="已加载，${idle_hint} $(( (unload_in + 59) / 60 )) 分钟后自动卸载，点击立即卸载" \
+          || detail="已加载，点击卸载" ;;
+    *)  detail="未加载，心跳或调用时自动加载，点击预加载" ;;
+  esac
   case "$st" in
     on)      echo "$2（$detail） | checked=true $(switch_cmd "$1" off)" ;;
     loading) echo "$2（加载中…） | color=#FF9F0A" ;;
@@ -94,7 +88,7 @@ if [[ "$state" == "running" ]]; then
   echo "---"
   engine_item tts "TTS 语音合成"
   engine_item stt "STT 语音识别"
-  echo "服务重启后恢复默认：TTS 常驻，STT 按需加载 | size=11 color=#8E8E93"
+  echo "TTS 随 App 心跳加载，STT 按需加载 | size=11 color=#8E8E93"
 elif [[ -n "$pid" && "$pid" != "-" ]]; then
   echo "PID $pid · 端口 $PORT | size=12"
 fi

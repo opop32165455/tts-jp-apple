@@ -21,6 +21,11 @@ from mlx_lm.sample_utils import apply_top_k, apply_top_p, categorical_sampling
 _ROLLOUTS = {}
 
 
+def reset():
+    """Drop compiled rollouts; they hold the model, so call this when unloading it."""
+    _ROLLOUTS.clear()
+
+
 def supports(model, text: str, ref_audio, ref_text: Optional[str]) -> bool:
     """True when Model.generate would take the base x-vector path with a single segment."""
     if getattr(model.config, "tts_model_type", "base") != "base":
