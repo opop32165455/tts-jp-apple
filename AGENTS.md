@@ -10,7 +10,7 @@ Read only this file, then the one matching row below, then the code. Do not prel
 
 | Task | Read |
 |---|---|
-| `speech_server.py`: TTS/STT behavior, post-processing, concurrency, config | `docs/architecture.md` |
+| `speech_server.py` / `qwen3_fast.py`: TTS/STT behavior, speed, post-processing, concurrency, config | `docs/architecture.md` |
 | `scripts/run_yuna_demo.py` batch generation | `docs/architecture.md` §Batch script |
 | launchd / ports / ffmpeg / env setup problems | `docs/agent-facts.md` |
 | Menu bar plugin `tools/swiftbar/` | the script itself + README §菜单栏管理 |
@@ -26,6 +26,7 @@ New verified facts or pitfalls go into `docs/agent-facts.md`, not into private a
 - New config: `SPEECH_SERVER_*` env var, keep the legacy `YUNA_TTS_*` fallback. Document it in the README env-var table.
 - `patch_transformers_tokenizer_loader()` exists in both `speech_server.py` and `scripts/run_yuna_demo.py`; change both together.
 - Never commit to `upstream-main`. `upstream` remote is fetch-only.
+- `qwen3_fast.py` mirrors mlx-audio internals (pinned commit in `requirements.txt`). After changing mlx / mlx-audio versions or `qwen3_fast.py`, run `.venv/bin/python scripts/check_fast_tts.py`; it must print `PASS: bit-identical`.
 - Do not modify or run anything in `legacy/`.
 
 ## Verify

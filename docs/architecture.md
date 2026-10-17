@@ -15,6 +15,7 @@ FastAPI app, default `127.0.0.1:7790`. Config is module-level constants read fro
 ### TTS — `POST /v1/tts` → `synthesize_wav_bytes`
 
 - Sync endpoint (runs in FastAPI threadpool). `MODEL.generate()` is not thread-safe: all synthesis runs under `MODEL_LOCK`, so requests are serialized.
+- Fast path (`FAST_TTS`, default on): when `qwen3_fast.supports()` (base model, x-vector path i.e. no `ref_text`, no `\n` in text) synthesis goes through `qwen3_fast.generate`, a copy of mlx-audio's single-segment loop where the per-token 15-step code-predictor rollout is one `mx.compile` graph (random state threaded through) and the per-step `mx.clear_cache()` is dropped. Bit-identical to `Model.generate` for the same seed; `scripts/check_fast_tts.py` verifies it. Compiled graphs are cached per (temperature, top_k, top_p); `_warm_up_tts` traces the default one after model load. Per token: talker ~16 ms (memory-bandwidth bound at 8-bit), code predictor ~20 ms → ~12 ms compiled.
 - `max_tokens`: if the caller omits it and text ≤ 20 chars, clamp to `max(32, min(default, len*8))` to stop repetition loops on short text.
 - Post-processing: 20 ms linear fade-in (kills vocoder DC pop); output < 0.3 s is rejected as truncation (error, not silent).
 - After each request: `mx.clear_cache()` + `gc.collect()`.

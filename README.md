@@ -168,6 +168,7 @@ STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 �
 | `SPEECH_SERVER_TTS_ENABLED` | `1` | 启动时是否加载 TTS |
 | `SPEECH_SERVER_STT_ENABLED` | `0` | 启动时是否预加载 STT（不预加载时，调用时会自动加载） |
 | `SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS` | `600` | STT 空闲多少秒后自动卸载，`0` 表示不卸载 |
+| `SPEECH_SERVER_FAST_TTS` | `1` | 使用编译优化的生成循环（`qwen3_fast.py`，音质不变，约快 15～20%），`0` 表示使用 mlx-audio 原版 |
 | `SPEECH_SERVER_WIRED_LIMIT_MB` | `3072` | 把模型权重锁定在内存里，防止被系统换出（见下文），`0` 表示不锁定 |
 
 旧的 `YUNA_TTS_*` 同名变量仍然兼容。
@@ -248,8 +249,10 @@ tts-jp-apple/
 ├── speech_server.py      # FastAPI 服务（TTS + STT）
 ├── manage_service.sh     # launchd 服务管理
 ├── main.py               # 交互式终端应用（上游）
+├── qwen3_fast.py         # 编译优化的 Qwen3-TTS 生成循环（与原版逐位一致）
 ├── scripts/
-│   └── run_yuna_demo.py  # 离线批量克隆
+│   ├── run_yuna_demo.py  # 离线批量克隆
+│   └── check_fast_tts.py # 校验 qwen3_fast 与原版逐位一致并对比速度
 ├── tools/swiftbar/       # 菜单栏状态与启停插件
 ├── AGENTS.md             # AI 编码助手的规则与文档路由（CLAUDE.md 引用它）
 ├── docs/
@@ -271,6 +274,7 @@ tts-jp-apple/
 
 - **开头的“噗”声**：声码器第一帧会产生直流冲击。服务端对输出加了 20 ms 线性淡入，客户端不需要再处理。
 - **久未调用后第一次很慢**：内存紧张时，macOS 会把闲置进程的内存换出到交换区。MLX 默认不锁定模型内存，所以闲置的 TTS 权重（约 2.7 GB）会被换出，下一次调用要先把它读回来。实测这种情况要 6.5 秒，日志里空闲 1 小时以上后的第一次调用中位数是 13 秒（平时约 2 秒）。服务启动时会调用 `mx.set_wired_limit` 把模型锁定在内存里，从而避免这个问题。代价是这部分内存（TTS 约 2.7 GB；STT 加载期间另外约 2 GB）一直占着，不能被系统挪给其他程序。
+- **合成提速（`qwen3_fast.py`）**：每个 token 要跑 1 次主模型（约 16 ms，受内存带宽限制）和 15 次 code predictor 小模型（约 20 ms，主要是大量小 kernel 的开销）。`qwen3_fast.py` 用 `mx.compile` 把每个 token 的 15 步 code predictor 编译成一张计算图，并去掉了每步都清空 MLX 缓存的操作。权重、算法和采样都没变：同一个随机种子下，输出和 mlx-audio 原版逐位相同。20 假名的句子从约 1.8 秒降到约 1.5 秒。服务启动时会先预热约 2 秒，完成编译。升级 mlx / mlx-audio 后，需要运行 `.venv/bin/python scripts/check_fast_tts.py` 确认输出仍然逐位相同；如果不一致，先设置 `SPEECH_SERVER_FAST_TTS=0`。
 - **短文本重复发音**：Qwen3-TTS 合成极短文本时，如果 `max_tokens` 过大，容易反复读同一个音。调用方没有传 `max_tokens` 且文本 ≤ 20 字时，服务会把它限制为 `max(32, min(默认值, 字数 × 8))`。生成的音频短于 0.3 秒会被当作截断，直接报错。
 - **并发**：`MODEL.generate()` 不是线程安全的，所有合成请求都会串行执行。每次请求结束后会清理 MLX 缓存（上限 2 GB），并执行 GC。
 - **STT 按需加载**：Whisper 很少用，所以启动时不加载，收到第一个识别请求时才加载，空闲 10 分钟后自动卸载。调用方不需要做任何改动，只是加载后的第一个请求会慢约 2 秒。
