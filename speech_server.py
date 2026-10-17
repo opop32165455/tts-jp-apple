@@ -10,6 +10,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -252,10 +253,20 @@ def patch_transformers_tokenizer_loader():
     AutoTokenizer.from_pretrained = from_pretrained_with_mistral_fix
 
 
+# 日语振假名（Furigana / 括号注音）正则：匹配 [汉字] 紧跟 [全角/半角括号包围的纯平假名/片假名/长音符]
+# 将 "漢字（ふりがな）" 提取为 "ふりがな"，以便 TTS 准确发音，避免大模型把汉字与注音连续朗读两遍。
+# 括号内含汉字、英文、数字时（如 "東京（羽田）発"、"午後（14時）"）不匹配，保留原样朗读。
+RUBY_PATTERN = re.compile(r"([\u4e00-\u9faf]+)[（\(]([ぁ-んァ-ヶー]+)[）\)]")
+
+
 def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
-    normalized = req.text.strip()
-    if not normalized:
+    raw_text = req.text.strip()
+    if not raw_text:
         raise ValueError("text is empty")
+
+    normalized = RUBY_PATTERN.sub(r"\2", raw_text)
+    if normalized != raw_text:
+        logger.info(f"[TTS FURIGANA] {raw_text!r} -> {normalized!r}")
 
     temperature = (
         req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
