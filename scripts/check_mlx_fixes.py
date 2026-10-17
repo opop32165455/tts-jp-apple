@@ -29,15 +29,15 @@ def main():
     for c_in, c_out, stride in [(768, 384, 8), (384, 192, 5), (192, 96, 4), (96, 48, 3)]:
         conv = nn.ConvTranspose1d(c_in, c_out, 2 * stride, stride=stride)
         conv.bias = mx.random.normal(conv.bias.shape)
-        for out_len in (30000, 61440, 160000):
-            x = mx.random.normal((1, out_len // stride, c_in))
+        for batch, out_len in ((1, 30000), (1, 61440), (1, 160000), (4, 12000), (3, 61440)):
+            x = mx.random.normal((batch, out_len // stride, c_in))
             with mx.stream(mx.cpu):
                 ref = np.array(raw_call(conv, x))
             raw_err = float(np.abs(np.array(raw_call(conv, x)) - ref).max())
             fixed_err = float(np.abs(np.array(mlx_fixes._chunked_call(conv, x)) - ref).max())
             raw_bug |= raw_err > TOL
             ok &= fixed_err <= TOL
-            print(f"stride {stride} out {ref.shape[1]:6d}: raw GPU err {raw_err:8.4f}  fixed GPU err {fixed_err:.5f}")
+            print(f"stride {stride} batch {batch} out {ref.shape[1]:6d}: raw GPU err {raw_err:8.4f}  fixed GPU err {fixed_err:.5f}")
     print(f"raw GPU bug: {'present' if raw_bug else 'gone'}")
     print("PASS: fixed path matches CPU" if ok else "FAIL: fixed path differs from CPU")
     sys.exit(0 if ok else 1)
