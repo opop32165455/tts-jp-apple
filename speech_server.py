@@ -17,11 +17,13 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import mlx.core as mx
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Request
@@ -74,13 +76,20 @@ DEFAULT_MODEL = os.environ.get(
         os.path.join(BASE_DIR, "models", "Qwen3-TTS-12Hz-1.7B-Base-8bit"),
     ),
 )
+_yuna_long = os.path.join(BASE_DIR, "ref-audio", "yuna.wav")
+_yuna_short = os.path.join(BASE_DIR, "ref-audio", "yuna_short_4s.wav")
+_DEFAULT_REF_FALLBACK = _yuna_long if os.path.isfile(_yuna_long) else _yuna_short
+
 DEFAULT_REF_AUDIO = os.environ.get(
     "SPEECH_SERVER_REF_AUDIO",
     os.environ.get(
         "YUNA_TTS_REF_AUDIO",
-        # 默认参考音频放在项目内 ref-audio/（不纳入 git，需自行放置），也可用环境变量指定。
-        os.path.join(BASE_DIR, "ref-audio", "yuna_short_4s.wav"),
+        _DEFAULT_REF_FALLBACK,
     ),
+)
+DEFAULT_SPEAKER_PROFILE = os.environ.get(
+    "SPEECH_SERVER_SPEAKER_PROFILE",
+    os.environ.get("YUNA_TTS_SPEAKER_PROFILE", None),
 )
 DEFAULT_REF_TEXT = (
     os.environ.get(
@@ -145,13 +154,13 @@ FAST_TTS = _env_flag("SPEECH_SERVER_FAST_TTS", "YUNA_TTS_FAST_TTS", True)
 TTS_IDLE_UNLOAD_SECONDS = int(
     os.environ.get(
         "SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS",
-        os.environ.get("YUNA_TTS_TTS_IDLE_UNLOAD_SECONDS", "600"),
+        os.environ.get("YUNA_TTS_TTS_IDLE_UNLOAD_SECONDS", "120"),
     )
 )
 STT_IDLE_UNLOAD_SECONDS = int(
     os.environ.get(
         "SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS",
-        os.environ.get("YUNA_TTS_STT_IDLE_UNLOAD_SECONDS", "600"),
+        os.environ.get("YUNA_TTS_STT_IDLE_UNLOAD_SECONDS", "120"),
     )
 )
 
@@ -217,6 +226,7 @@ TTS_LAST_ACTIVE = 0.0  # time.monotonic() of the last heartbeat, TTS request or 
 TTS_LAST_ERROR: Optional[str] = None  # last background load failure, cleared on success
 _TTS_LOADER: Optional[threading.Thread] = None
 _TTS_LOADER_LOCK = threading.Lock()
+SPEAKER_PROFILE_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 
 
 class TTSRequest(BaseModel):
@@ -263,7 +273,225 @@ def patch_transformers_tokenizer_loader():
 RUBY_PATTERN = re.compile(r"([\u4e00-\u9faf]+)[（\(]([ぁ-んァ-ヶー]+)[）\)]")
 
 
-def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
+def _is_path_in_dir(path: str, base_dir: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(base_dir)]) == os.path.abspath(base_dir)
+    except Exception:
+        return False
+
+
+def _check_embed_shape(emb: mx.array, source: str):
+    """Raise ValueError unless emb matches the loaded model's speaker encoder output (1, enc_dim)."""
+    expected = (1, MODEL.config.speaker_encoder_config.enc_dim)
+    if tuple(emb.shape) != expected:
+        raise ValueError(f"speaker profile {source} has shape {tuple(emb.shape)}, current model expects {expected}")
+
+
+def _store_profile_cache(
+    norm_ref: str,
+    emb: mx.array,
+    watch_file: Optional[str] = None,
+    audio_file: Optional[str] = None,
+):
+    """Store an embedding in SPEAKER_PROFILE_CACHE with metadata for freshness validation and true LRU eviction."""
+    # Enforce LRU eviction if cache size >= 16 (default ref audio is never evicted)
+    if len(SPEAKER_PROFILE_CACHE) >= 16:
+        default_norm = os.path.abspath(DEFAULT_REF_AUDIO)
+        keys_to_evict = [k for k in SPEAKER_PROFILE_CACHE if k != default_norm]
+        for k in keys_to_evict[:8]:
+            SPEAKER_PROFILE_CACHE.pop(k, None)
+
+    current_model_id = getattr(MODEL, "model_id", DEFAULT_MODEL) if MODEL else DEFAULT_MODEL
+    entry = {
+        "emb": emb,
+        "model_id": current_model_id,
+        "dim": tuple(emb.shape),
+        "watch_file": watch_file,
+        "watch_mtime": os.path.getmtime(watch_file) if (watch_file and os.path.isfile(watch_file)) else None,
+        "watch_size": os.path.getsize(watch_file) if (watch_file and os.path.isfile(watch_file)) else None,
+        "audio_file": audio_file,
+        "audio_mtime": os.path.getmtime(audio_file) if (audio_file and os.path.isfile(audio_file)) else None,
+        "audio_size": os.path.getsize(audio_file) if (audio_file and os.path.isfile(audio_file)) else None,
+    }
+    SPEAKER_PROFILE_CACHE[norm_ref] = entry
+    SPEAKER_PROFILE_CACHE.move_to_end(norm_ref)
+
+
+def _resolve_speaker_profile(ref_audio: Optional[str]) -> tuple[Optional[mx.array], bool]:
+    """Resolve and return (speaker_embed, is_cached) for the given ref_audio or profile path.
+
+    Caller holds MODEL_LOCK.
+    """
+    if MODEL is None or not ref_audio:
+        return None, False
+
+    if not os.path.isabs(ref_audio):
+        candidate = os.path.join(BASE_DIR, ref_audio)
+        if os.path.exists(candidate):
+            ref_audio = candidate
+
+    norm_ref = os.path.abspath(ref_audio) if os.path.exists(ref_audio) else ref_audio
+    is_default = (ref_audio == DEFAULT_REF_AUDIO or norm_ref == os.path.abspath(DEFAULT_REF_AUDIO))
+    current_model_id = getattr(MODEL, "model_id", DEFAULT_MODEL)
+
+    # 1. Check in-memory cache
+    if norm_ref in SPEAKER_PROFILE_CACHE:
+        cached_entry = SPEAKER_PROFILE_CACHE[norm_ref]
+        if isinstance(cached_entry, dict):
+            valid = True
+            # Model identity check
+            if cached_entry.get("model_id") and cached_entry.get("model_id") != current_model_id:
+                valid = False
+
+            # Watch file freshness check (the file that was loaded, e.g. .npz/.npy or source .wav)
+            watch_file = cached_entry.get("watch_file")
+            if watch_file:
+                if not os.path.isfile(watch_file):
+                    valid = False
+                elif (
+                    os.path.getmtime(watch_file) != cached_entry.get("watch_mtime")
+                    or os.path.getsize(watch_file) != cached_entry.get("watch_size")
+                ):
+                    valid = False
+
+            # Audio file freshness check (if a sidecar was used, did the audio get updated?)
+            audio_file = cached_entry.get("audio_file")
+            if valid and audio_file and os.path.isfile(audio_file):
+                if (
+                    os.path.getmtime(audio_file) != cached_entry.get("audio_mtime")
+                    or os.path.getsize(audio_file) != cached_entry.get("audio_size")
+                ):
+                    valid = False
+
+            if not valid:
+                logger.info(f"[SPEAKER PROFILE] Source file modified or model changed ({ref_audio}), invalidating memory cache")
+                SPEAKER_PROFILE_CACHE.pop(norm_ref, None)
+            else:
+                SPEAKER_PROFILE_CACHE.move_to_end(norm_ref)
+                return cached_entry["emb"], True
+        else:
+            return cached_entry, True
+
+    # 2. Directly a .npy or .npz vector file passed as ref_audio
+    if (ref_audio.endswith(".npz") or ref_audio.endswith(".npy")) and os.path.isfile(ref_audio):
+        try:
+            if ref_audio.endswith(".npz"):
+                with np.load(ref_audio, allow_pickle=False) as data:
+                    arr = data["embedding"]
+            else:
+                arr = np.load(ref_audio)
+            emb = mx.array(arr)
+            mx.eval(emb)
+            _check_embed_shape(emb, ref_audio)
+            _store_profile_cache(norm_ref=norm_ref, emb=emb, watch_file=ref_audio, audio_file=None)
+            logger.info(f"[SPEAKER PROFILE] Loaded vector profile from {ref_audio}")
+            return emb, True
+        except Exception as exc:
+            # The caller asked for this exact vector; there is no audio to fall back to.
+            raise ValueError(f"cannot use speaker profile {ref_audio}: {exc}") from exc
+
+    # 3. For DEFAULT_REF_AUDIO ONLY: If user explicitly configured SPEECH_SERVER_SPEAKER_PROFILE,
+    # it takes top priority over auto-detected sidecars.
+    if is_default and DEFAULT_SPEAKER_PROFILE:
+        if os.path.isfile(DEFAULT_SPEAKER_PROFILE):
+            try:
+                if DEFAULT_SPEAKER_PROFILE.endswith(".npz"):
+                    with np.load(DEFAULT_SPEAKER_PROFILE, allow_pickle=False) as data:
+                        arr = data["embedding"]
+                else:
+                    arr = np.load(DEFAULT_SPEAKER_PROFILE)
+                emb = mx.array(arr)
+                mx.eval(emb)
+                _check_embed_shape(emb, DEFAULT_SPEAKER_PROFILE)
+                _store_profile_cache(
+                    norm_ref=norm_ref,
+                    emb=emb,
+                    watch_file=DEFAULT_SPEAKER_PROFILE,
+                    audio_file=ref_audio if os.path.isfile(ref_audio) else None,
+                )
+                logger.info(
+                    f"[SPEAKER PROFILE] Loaded user configured SPEECH_SERVER_SPEAKER_PROFILE: {DEFAULT_SPEAKER_PROFILE}"
+                )
+                return emb, True
+            except Exception as exc:
+                logger.warning(
+                    f"[SPEAKER PROFILE] Failed loading SPEECH_SERVER_SPEAKER_PROFILE {DEFAULT_SPEAKER_PROFILE}: {exc!r}"
+                )
+        else:
+            logger.warning(
+                f"[SPEAKER PROFILE] SPEECH_SERVER_SPEAKER_PROFILE does not exist: {DEFAULT_SPEAKER_PROFILE}"
+            )
+
+    # 4. Check sidecar profile (only *_speaker_profile.npz, which records model_id; old .npy sidecars are ignored)
+    stem, _ = os.path.splitext(ref_audio)
+    candidate = f"{stem}_speaker_profile.npz"
+    if os.path.isfile(candidate) and os.path.isfile(ref_audio):
+        if os.path.getmtime(ref_audio) > os.path.getmtime(candidate):
+            logger.info(f"[SPEAKER PROFILE] Audio {ref_audio} is newer than sidecar {candidate}. Re-extracting...")
+        else:
+            try:
+                with np.load(candidate, allow_pickle=False) as data:
+                    saved_model_id = str(data["model_id"])
+                    arr = data["embedding"]
+                if saved_model_id != current_model_id:
+                    raise ValueError(f"saved for model {saved_model_id}, current is {current_model_id}")
+                emb = mx.array(arr)
+                mx.eval(emb)
+                _check_embed_shape(emb, candidate)
+                _store_profile_cache(
+                    norm_ref=norm_ref,
+                    emb=emb,
+                    watch_file=candidate,
+                    audio_file=ref_audio,
+                )
+                logger.info(f"[SPEAKER PROFILE] Loaded sidecar profile from {candidate} for {ref_audio}")
+                return emb, True
+            except Exception as exc:
+                logger.warning(f"[SPEAKER PROFILE] Ignoring sidecar {candidate} ({exc}). Re-extracting...")
+
+    # 5. Extract from audio file once
+    if os.path.isfile(ref_audio):
+        try:
+            from mlx_audio.utils import load_audio
+            t0 = time.perf_counter()
+            audio = load_audio(ref_audio, sample_rate=MODEL.sample_rate)
+            emb = MODEL.extract_speaker_embedding(audio)
+            mx.eval(emb)
+
+            _store_profile_cache(
+                norm_ref=norm_ref,
+                emb=emb,
+                watch_file=ref_audio,
+                audio_file=ref_audio,
+            )
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                f"[SPEAKER PROFILE] Extracted & cached speaker profile for {ref_audio} in {elapsed*1000:.1f}ms"
+            )
+
+            # Restrict sidecar writes: only save for DEFAULT_REF_AUDIO or files inside project's ref-audio/
+            ref_dir = os.path.join(BASE_DIR, "ref-audio")
+            if is_default or _is_path_in_dir(ref_audio, ref_dir):
+                sidecar_path = f"{stem}_speaker_profile.npz"
+                try:
+                    np.savez(
+                        sidecar_path,
+                        embedding=np.array(emb),
+                        model_id=current_model_id,
+                        dim=list(emb.shape),
+                    )
+                    logger.info(f"[SPEAKER PROFILE] Saved sidecar profile to: {sidecar_path}")
+                except Exception as exc:
+                    logger.warning(f"[SPEAKER PROFILE] Failed writing sidecar {sidecar_path}: {exc!r}")
+
+            return emb, True
+        except Exception as exc:
+            logger.warning(f"[SPEAKER PROFILE] Extraction failed for {ref_audio}: {exc!r}")
+
+    return None, False
+
+
+def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str], bool]:
     raw_text = req.text.strip()
     if not raw_text:
         raise ValueError("text is empty")
@@ -286,6 +514,10 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
         req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS
     )
     ref_audio = req.ref_audio if req.ref_audio is not None else DEFAULT_REF_AUDIO
+    if ref_audio and not os.path.isabs(ref_audio):
+        candidate = os.path.join(BASE_DIR, ref_audio)
+        if os.path.exists(candidate):
+            ref_audio = candidate
     ref_text = req.ref_text if req.ref_text is not None else DEFAULT_REF_TEXT
     if ref_text == "":
         ref_text = None
@@ -294,6 +526,27 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
     # Prevent autoregressive repetition on short texts/words
     if req.max_tokens is None and len(normalized) <= 20:
         max_tokens = max(32, min(max_tokens, len(normalized) * 8))
+
+    is_vector_ref = bool(ref_audio and ref_audio.endswith((".npy", ".npz")))
+    if is_vector_ref:
+        if not os.path.isfile(ref_audio):
+            raise HTTPException(status_code=400, detail=f"Reference vector profile not found: {ref_audio}")
+        if not FAST_TTS:
+            raise HTTPException(
+                status_code=400,
+                detail="Direct .npy/.npz ref_audio requires FAST_TTS enabled (SPEECH_SERVER_FAST_TTS=1).",
+            )
+        if "\n" in normalized:
+            raise HTTPException(
+                status_code=400,
+                detail="Direct .npy/.npz ref_audio does not support multi-segment text containing newlines. "
+                "Please submit text line by line.",
+            )
+        if ref_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Direct .npy/.npz ref_audio cannot be combined with ref_text (ICL mode needs the audio file).",
+            )
 
     start_time = time.time()
     logger.info(
@@ -310,11 +563,18 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
             result_count = 0
             audio = None
             sample_rate = None
+            speaker_embed, is_resolved = (None, False)
+            if not ref_text:
+                speaker_embed, is_resolved = _resolve_speaker_profile(ref_audio)
+
+            used_cached_profile = False
             if FAST_TTS and qwen3_fast.supports(MODEL, normalized, ref_audio, ref_text):
+                # Profiles are shape-checked in _resolve_speaker_profile, so no retry here.
                 audio, sample_rate = qwen3_fast.generate(
                     MODEL,
                     normalized,
                     ref_audio=ref_audio,
+                    speaker_embed=speaker_embed,
                     lang_code=lang_code,
                     temperature=temperature,
                     top_k=top_k,
@@ -323,6 +583,7 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
                     max_tokens=max_tokens,
                 )
                 result_count = 1
+                used_cached_profile = speaker_embed is not None and is_resolved
             else:
                 for result in MODEL.generate(
                     text=normalized,
@@ -369,9 +630,9 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str]]:
 
         logger.info(
             f"[TTS SUCCESS] text={normalized!r} | audio_duration={audio_dur:.2f}s | "
-            f"synthesis_time={elapsed:.2f}s | rtf={rtf:.2f}x | wav_bytes={len(wav_bytes)}"
+            f"synthesis_time={elapsed:.2f}s | rtf={rtf:.2f}x | profile_cached={used_cached_profile} | wav_bytes={len(wav_bytes)}"
         )
-        return wav_bytes, ref_audio, ref_text
+        return wav_bytes, ref_audio, ref_text, used_cached_profile
     except Exception as exc:
         elapsed = time.time() - start_time
         logger.error(
@@ -425,6 +686,10 @@ def stream_audio_generator(req: TTSRequest):
         req.max_tokens if req.max_tokens is not None else DEFAULT_MAX_TOKENS
     )
     ref_audio = req.ref_audio if req.ref_audio is not None else DEFAULT_REF_AUDIO
+    if ref_audio and not os.path.isabs(ref_audio):
+        candidate = os.path.join(BASE_DIR, ref_audio)
+        if os.path.exists(candidate):
+            ref_audio = candidate
     ref_text = req.ref_text if req.ref_text is not None else DEFAULT_REF_TEXT
     if ref_text == "":
         ref_text = None
@@ -434,6 +699,13 @@ def stream_audio_generator(req: TTSRequest):
 
     if req.max_tokens is None and len(normalized) <= 20:
         max_tokens = max(32, min(max_tokens, len(normalized) * 8))
+
+    if ref_audio and ref_audio.endswith((".npy", ".npz")):
+        raise HTTPException(
+            status_code=400,
+            detail="Streaming endpoint /v1/tts/stream does not support direct .npy/.npz ref_audio. "
+            "Please provide an audio file (.wav) or use /v1/tts.",
+        )
 
     start_time = time.time()
     logger.info(
@@ -445,52 +717,65 @@ def stream_audio_generator(req: TTSRequest):
     is_first_chunk = True
     total_samples = 0
     total_chunks = 0
+    gen = None
 
     try:
+        if audio_format == "wav":
+            yield _make_wav_header(sample_rate=sample_rate)
+
         with MODEL_LOCK:
             if MODEL is None:
                 raise RuntimeError("model not loaded")
 
-            if audio_format == "wav":
-                yield _make_wav_header(sample_rate=sample_rate)
+            gen = iter(
+                MODEL.generate(
+                    text=normalized,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    lang_code=lang_code,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    max_tokens=max_tokens,
+                    stream=True,
+                    streaming_interval=streaming_interval,
+                    verbose=False,
+                )
+            )
 
-            for result in MODEL.generate(
-                text=normalized,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                lang_code=lang_code,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                max_tokens=max_tokens,
-                stream=True,
-                streaming_interval=streaming_interval,
-                verbose=False,
-            ):
-                chunk = result.audio
-                if chunk is None or len(chunk) == 0:
-                    continue
-                if not isinstance(chunk, np.ndarray):
-                    chunk = np.array(chunk, dtype=np.float32)
+        while True:
+            # Step the MLX generator under MODEL_LOCK so Metal operations are serialized,
+            # but do NOT hold the lock during network socket yields!
+            with MODEL_LOCK:
+                try:
+                    result = next(gen)
+                except StopIteration:
+                    break
 
-                sample_rate = result.sample_rate
+            chunk = result.audio
+            if chunk is None or len(chunk) == 0:
+                continue
+            if not isinstance(chunk, np.ndarray):
+                chunk = np.array(chunk, dtype=np.float32)
 
-                if is_first_chunk:
-                    fade_len = min(len(chunk), int(sample_rate * 0.02))
-                    if fade_len > 0:
-                        fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-                        chunk[:fade_len] = chunk[:fade_len] * fade_in
-                    ttfa = time.time() - start_time
-                    logger.info(f"[TTS STREAM TTFA] first chunk ready in {ttfa*1000:.1f}ms ({len(chunk)} samples)")
-                    is_first_chunk = False
+            sample_rate = result.sample_rate
 
-                total_samples += len(chunk)
-                total_chunks += 1
+            if is_first_chunk:
+                fade_len = min(len(chunk), int(sample_rate * 0.02))
+                if fade_len > 0:
+                    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    chunk[:fade_len] = chunk[:fade_len] * fade_in
+                ttfa = time.time() - start_time
+                logger.info(f"[TTS STREAM TTFA] first chunk ready in {ttfa*1000:.1f}ms ({len(chunk)} samples)")
+                is_first_chunk = False
 
-                pcm_data = np.clip(chunk, -1.0, 1.0)
-                pcm_bytes = (pcm_data * 32767.0).astype(np.int16).tobytes()
-                yield pcm_bytes
+            total_samples += len(chunk)
+            total_chunks += 1
+
+            pcm_data = np.clip(chunk, -1.0, 1.0)
+            pcm_bytes = (pcm_data * 32767.0).astype(np.int16).tobytes()
+            yield pcm_bytes
 
         elapsed = time.time() - start_time
         total_dur = total_samples / sample_rate if sample_rate > 0 else 0.0
@@ -505,6 +790,12 @@ def stream_audio_generator(req: TTSRequest):
         logger.error(f"[TTS STREAM ERROR] text={normalized!r} | error={exc!r}")
         raise
     finally:
+        if gen is not None:
+            try:
+                with MODEL_LOCK:
+                    gen.close()
+            except Exception:
+                pass
         touch_tts()
         _release_mlx_memory()
 
@@ -528,10 +819,12 @@ def _warm_up_tts():
     started = time.time()
     try:
         with MODEL_LOCK:
+            speaker_embed, is_cached = _resolve_speaker_profile(DEFAULT_REF_AUDIO)
             qwen3_fast.generate(
                 MODEL,
                 "こんにちは",
                 ref_audio=DEFAULT_REF_AUDIO,
+                speaker_embed=speaker_embed,
                 lang_code=DEFAULT_LANG,
                 temperature=DEFAULT_TEMPERATURE,
                 top_k=DEFAULT_TOP_K,
@@ -539,7 +832,7 @@ def _warm_up_tts():
                 repetition_penalty=DEFAULT_REPETITION_PENALTY,
                 max_tokens=32,
             )
-        logger.info(f"TTS fast path warmed up in {time.time() - started:.2f}s")
+        logger.info(f"TTS fast path warmed up in {time.time() - started:.2f}s (profile_cached={is_cached})")
     except Exception as exc:
         logger.warning(f"TTS warm-up failed (requests will still work): {exc!r}")
     finally:
@@ -558,6 +851,7 @@ def _unload_tts_locked():
     with MODEL_LOCK:  # waits for an in-flight synthesis to finish
         MODEL = None
         qwen3_fast.reset()
+        SPEAKER_PROFILE_CACHE.clear()
     TTS_STATE = "off"
     _release_mlx_memory()
 
@@ -571,6 +865,7 @@ def set_tts_enabled(enabled: bool):
             started = time.time()
             try:
                 model = load_model(DEFAULT_MODEL)
+                model.model_id = DEFAULT_MODEL
             except Exception as exc:
                 TTS_STATE = "off"
                 TTS_LAST_ERROR = repr(exc)
@@ -789,6 +1084,11 @@ async def get_config():
         "model": DEFAULT_MODEL,
         "ref_audio": DEFAULT_REF_AUDIO,
         "ref_text": DEFAULT_REF_TEXT,
+        "speaker_profile": DEFAULT_SPEAKER_PROFILE,
+        "speaker_profile_cached": bool(
+            DEFAULT_REF_AUDIO in SPEAKER_PROFILE_CACHE
+            or os.path.abspath(DEFAULT_REF_AUDIO) in SPEAKER_PROFILE_CACHE
+        ),
         "lang_code": DEFAULT_LANG,
         "temperature": DEFAULT_TEMPERATURE,
         "top_p": DEFAULT_TOP_P,
@@ -810,7 +1110,9 @@ def tts(request: TTSRequest):
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"tts load failed: {exc}") from exc
     try:
-        wav, ref_audio, ref_text = synthesize_wav_bytes(request)
+        wav, ref_audio, ref_text, is_cached = synthesize_wav_bytes(request)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -821,6 +1123,7 @@ def tts(request: TTSRequest):
     headers = {
         "X-TTS-Ref-Audio": ref_audio,
         "X-TTS-Ref-Text": urllib.parse.quote(ref_text or ""),
+        "X-TTS-Profile-Cached": "true" if is_cached else "false",
     }
     return Response(content=wav, media_type="audio/wav", headers=headers)
 
@@ -833,6 +1136,14 @@ def tts_stream(request: TTSRequest):
             set_tts_enabled(True)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"tts load failed: {exc}") from exc
+
+    ref_audio = request.ref_audio or DEFAULT_REF_AUDIO
+    if ref_audio and ref_audio.endswith((".npy", ".npz")):
+        raise HTTPException(
+            status_code=400,
+            detail="Streaming endpoint /v1/tts/stream does not support direct .npy/.npz ref_audio. "
+            "Please provide an audio file (.wav) or use /v1/tts.",
+        )
 
     fmt = (request.format or "pcm").strip().lower()
     media_type = "audio/wav" if fmt == "wav" else "audio/pcm"

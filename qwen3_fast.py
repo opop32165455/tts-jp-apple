@@ -103,6 +103,7 @@ def generate(
     model,
     text: str,
     ref_audio=None,
+    speaker_embed: Optional[mx.array] = None,
     lang_code: str = "auto",
     temperature: float = 0.9,
     top_k: int = 50,
@@ -116,11 +117,27 @@ def generate(
         _ROLLOUTS[key] = _make_rollout(model, temperature, top_k, top_p)
     rollout = _ROLLOUTS[key]
 
-    if ref_audio is not None:
-        ref_audio = load_audio(ref_audio, sample_rate=model.sample_rate)
-    input_embeds, trailing, pad_embed = model._prepare_generation_inputs(
-        text, language=lang_code, speaker=None, ref_audio=ref_audio, ref_text=None
-    )
+    if speaker_embed is not None:
+        # MLX-Audio's Model._prepare_generation_inputs does not expose a parameter
+        # to receive precomputed speaker embeddings; it internally calls extract_speaker_embedding(ref_audio).
+        # Under MODEL_LOCK (enforced by the caller), we temporarily hook extract_speaker_embedding
+        # to return our cached embedding and supply a dummy 1-sample audio to ref_audio.
+        # This allows upstream Chat template tokenization, Rotary embeddings, special tokens,
+        # and language ID projections to run faithfully without STFT & neural encoder forward passes.
+        orig_extract = model.extract_speaker_embedding
+        model.extract_speaker_embedding = lambda *args, **kwargs: speaker_embed
+        try:
+            input_embeds, trailing, pad_embed = model._prepare_generation_inputs(
+                text, language=lang_code, speaker=None, ref_audio=mx.zeros(1), ref_text=None
+            )
+        finally:
+            model.extract_speaker_embedding = orig_extract
+    else:
+        if ref_audio is not None:
+            ref_audio = load_audio(ref_audio, sample_rate=model.sample_rate)
+        input_embeds, trailing, pad_embed = model._prepare_generation_inputs(
+            text, language=lang_code, speaker=None, ref_audio=ref_audio, ref_text=None
+        )
     talker = model.talker
     cfg = model.config.talker_config
     eos = cfg.codec_eos_token_id

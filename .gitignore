@@ -29,5 +29,7 @@ ref-audio/*
 data/*
 !data/.gitkeep
 legacy/
+experiments/
+todo-tts-local-optimization.md
 scripts/regenerate_grammar_example_audios.py
 CLAUDE.local.md

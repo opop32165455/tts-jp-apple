@@ -62,12 +62,17 @@ STT 需要 `ffmpeg` 来解码音频。系统里没有 `ffmpeg` 时，服务会�
 
 Whisper 模型会在第一次调用 STT 时自动下载到 HuggingFace 缓存。
 
-### 3. 准备参考音频
+### 3. 准备参考音频与声纹特征（Speaker Profile）
 
-仓库**不附带**参考音频。请准备一段 3~10 秒、干净无背景音的单人语音（WAV），用下面两种方式之一指定：
+仓库**不附带**参考音频。请准备一段 3~25 秒、干净无背景音的单人语音（WAV），用下面两种方式之一指定：
 
-- 放到默认路径 `ref-audio/yuna_short_4s.wav`
+- 放到默认路径：优先读取 `ref-audio/yuna.wav`，若无则回退 `ref-audio/yuna_short_4s.wav`
 - 用环境变量指定：`export SPEECH_SERVER_REF_AUDIO=/path/to/your_voice.wav`
+
+**声纹特征固化（Speaker Profile 缓存加速）：**
+服务在加载参考音频后，会自动将其声学嵌入向量（1×2048 float32，仅 8KB）固化保存为同名 sidecar 文件（例如 `ref-audio/yuna_speaker_profile.npz`，记录模型 ID）并常驻内存。后续请求将直接使用缓存的向量特征，跳过 WAV 读取、重采样、STFT 变换与神经编码器（22 秒参考音频冷启动约 260ms，热状态约 16ms），且输出音频位级完全一致（Bit-identical）。也可以通过 `export SPEECH_SERVER_SPEAKER_PROFILE=/path/to/profile.npz` 直接指定固化文件（`.npy` 也可）。
+
+> **注意**：替换参考音频（WAV）或更换模型后，服务会根据修改时间、模型 ID 和向量维度自动重新提取并覆盖 sidecar。旧版本生成的 `*_speaker_profile.npy` sidecar 不再读取，可以直接删除。
 
 再提供这段音频对应的文字（`SPEECH_SERVER_REF_TEXT`），克隆出来的声音会更像。
 
@@ -98,9 +103,9 @@ TTS 模型加载期间返回 `503`，其他时候返回各引擎的状态（`on`
 
 ```json
 { "status": "ok", "service": "speech_server", "lang_code": "japanese",
-  "tts": "on", "stt": "off", "tts_idle_unload_seconds": 600, "tts_unload_in_seconds": 412,
+  "tts": "on", "stt": "off", "tts_idle_unload_seconds": 120, "tts_unload_in_seconds": 92,
   "tts_error": null, "model_load_seconds": 1.15, "stt_load_seconds": 0.0,
-  "stt_idle_unload_seconds": 600, "stt_unload_in_seconds": null }
+  "stt_idle_unload_seconds": 120, "stt_unload_in_seconds": null }
 ```
 
 ### `POST /v1/heartbeat` — 客户端心跳
@@ -110,7 +115,7 @@ TTS 模型加载期间返回 `503`，其他时候返回各引擎的状态（`on`
 - TTS 已加载：只刷新空闲计时，立即返回。
 - TTS 未加载：后台开始加载（约 1～3 秒），接口立即返回 `"ready": false`；加 `?wait=true` 则等加载完成再返回（失败返回 `500`）。
 - 加载后的模型权重锁定在物理内存里（见下文"久未调用后第一次很慢"），不会被换到交换区。
-- 连续 `SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS`（默认 600 秒）既没有心跳也没有 TTS 请求，TTS 模型会被卸载，进程只占约 400 MB。下一次心跳或 TTS 请求会重新加载。
+- 连续 `SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS`（默认 120 秒）既没有心跳也没有 TTS 请求，TTS 模型会被卸载，进程只占约 400 MB。下一次心跳或 TTS 请求会重新加载。
 
 返回值是 `/health` 的引擎字段，外加 `ready`（TTS 是否可以立即合成）：
 
@@ -124,7 +129,7 @@ curl -s -X POST http://127.0.0.1:7790/v1/heartbeat
 TTS 和 STT 可以在运行中单独加载或卸载，不用重启进程，卸载后模型占用的内存会被释放。返回值和 `/health` 里的引擎字段一致。
 
 - **TTS**：跟随心跳加载和卸载（见上文）。`/v1/tts` 在未加载时会自动加载（这次请求多等约 1～3 秒），每次请求也会刷新空闲计时。`off` 立即卸载，下一次心跳或请求会重新加载。
-- **STT**：按需加载。卸载状态下收到识别请求时会自动加载模型（这次请求要多等约 2 秒），连续空闲 10 分钟（`SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS`）后自动卸载，可以省下约 1.5～2 GB 内存。`on` 用来提前预加载，`off` 用来立即卸载。
+- **STT**：按需加载。卸载状态下收到识别请求时会自动加载模型（这次请求要多等约 2 秒），连续空闲 2 分钟（`SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS`）后自动卸载，可以省下约 1.5～2 GB 内存。`on` 用来提前预加载，`off` 用来立即卸载。
 
 ```bash
 curl -X POST http://127.0.0.1:7790/v1/services/stt/on    # 预加载 Whisper（第一次会下载模型）
@@ -151,7 +156,7 @@ curl -X POST http://127.0.0.1:7790/v1/services/stt/off   # 立即卸载，释放
 | `top_p` | float | 否 | 默认 0.95 |
 | `max_tokens` | int | 否 | 不传时，短文本会自动收缩（见下文） |
 
-返回 `audio/wav`。响应头 `X-TTS-Ref-Audio` 是实际使用的参考音频路径。
+返回 `audio/wav`。响应头 `X-TTS-Ref-Audio` 是实际使用的参考音频路径，`X-TTS-Profile-Cached` 表示是否命中预烘焙声纹特征向量（`true` / `false`）。
 
 > **注音支持**：支持日语振假名注音语法 `漢字（ふりがな）`（例如 `臥薪嘗胆（がしんしょうたん）` 或 `東海林（しょうじ）さん`），服务端会自动提取括号内的平假名发音，避免大模型把汉字与注音连续朗读两遍。
 
@@ -208,8 +213,9 @@ STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 �
 | `SPEECH_SERVER_HOST` | `127.0.0.1` | 监听地址 |
 | `SPEECH_SERVER_PORT` | `7790` | 监听端口 |
 | `SPEECH_SERVER_MODEL` | `models/Qwen3-TTS-12Hz-1.7B-Base-8bit` | TTS 模型目录 |
-| `SPEECH_SERVER_REF_AUDIO` | `ref-audio/yuna_short_4s.wav` | 默认参考音频 |
+| `SPEECH_SERVER_REF_AUDIO` | `ref-audio/yuna.wav` (或 `yuna_short_4s.wav`) | 默认参考音频 |
 | `SPEECH_SERVER_REF_TEXT` | 空 | 默认参考音频对应的文字 |
+| `SPEECH_SERVER_SPEAKER_PROFILE` | 空（自动查找 `<audio>_speaker_profile.npz`） | 预固化声纹向量文件路径（仅对默认参考音频生效） |
 | `SPEECH_SERVER_LANG` | `japanese` | 默认语言 |
 | `SPEECH_SERVER_TEMPERATURE` | `0.65` | 采样温度 |
 | `SPEECH_SERVER_TOP_P` | `0.95` | Top-P |
@@ -219,8 +225,8 @@ STT 没有加载时，第一次请求会自动加载模型，所以会慢约 2 �
 | `SPEECH_SERVER_MLX_WHISPER_MODEL` | `mlx-community/whisper-large-v3-turbo` | STT 模型 |
 | `SPEECH_SERVER_TTS_ENABLED` | `1` | 启动时是否加载 TTS |
 | `SPEECH_SERVER_STT_ENABLED` | `0` | 启动时是否预加载 STT（不预加载时，调用时会自动加载） |
-| `SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS` | `600` | 多少秒没有心跳和 TTS 请求就卸载 TTS，`0` 表示常驻不卸载 |
-| `SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS` | `600` | STT 空闲多少秒后自动卸载，`0` 表示不卸载 |
+| `SPEECH_SERVER_TTS_IDLE_UNLOAD_SECONDS` | `120` | 多少秒没有心跳和 TTS 请求就卸载 TTS，`0` 表示常驻不卸载 |
+| `SPEECH_SERVER_STT_IDLE_UNLOAD_SECONDS` | `120` | STT 空闲多少秒后自动卸载，`0` 表示不卸载 |
 | `SPEECH_SERVER_FAST_TTS` | `1` | 使用编译优化的生成循环（`qwen3_fast.py`，音质不变，约快 15～20%），`0` 表示使用 mlx-audio 原版 |
 | `SPEECH_SERVER_WIRED_LIMIT_MB` | `3072` | 把模型权重锁定在内存里，防止被系统换出（见下文），`0` 表示不锁定 |
 
@@ -332,7 +338,8 @@ tts-jp-apple/
 - **合成提速（`qwen3_fast.py`）**：每个 token 要跑 1 次主模型（约 16 ms，受内存带宽限制）和 15 次 code predictor 小模型（约 20 ms，主要是大量小 kernel 的开销）。`qwen3_fast.py` 用 `mx.compile` 把每个 token 的 15 步 code predictor 编译成一张计算图，并去掉了每步都清空 MLX 缓存的操作。权重、算法和采样都没变：同一个随机种子下，输出和 mlx-audio 原版逐位相同。20 假名的句子从约 1.8 秒降到约 1.5 秒。服务启动时会先预热约 2 秒，完成编译。升级 mlx / mlx-audio 后，需要运行 `.venv/bin/python scripts/check_fast_tts.py` 确认输出仍然逐位相同；如果不一致，先设置 `SPEECH_SERVER_FAST_TTS=0`。
 - **句子开头漏读（已修复）**：MLX 0.30.3 的 Metal `conv_transpose1d` 有个 bug：输出长度超过约 32768 时，开头那段结果会出错。声码器最后一层上采样输出的是 24 kHz 音频，所以所有长于约 1.36 秒的音频，开头都会变成静音或杂音，听起来像是“漏读了开头几个字”，和模型本身、文本写法都无关。`mlx_fixes.py` 把这个算子改成分块计算，结果和 CPU 一致，每次解码只多约 15 ms。升级 mlx 后需要运行 `.venv/bin/python scripts/check_mlx_fixes.py` 确认修复仍然有效。**修复前生成的音频，开头很可能已经受损**，需要的话请重新生成。
 - **短文本重复发音**：Qwen3-TTS 合成极短文本时，如果 `max_tokens` 过大，容易反复读同一个音。调用方没有传 `max_tokens` 且文本 ≤ 20 字时，服务会把它限制为 `max(32, min(默认值, 字数 × 8))`。生成的音频短于 0.3 秒会被当作截断，直接报错。
-- **并发**：`MODEL.generate()` 不是线程安全的，所有合成请求都会串行执行。每次请求结束后会清理 MLX 缓存（上限 2 GB），并执行 GC。
+- **声纹向量缓存（Speaker Profile）**：Qwen3-TTS 每次克隆通常需要重新提取参考音频的声学特征与 Speaker Embedding（22 秒参考音频冷启动约 260ms，热状态约 16ms）。服务内置内存 LRU 缓存并支持持久化 sidecar（`<stem>_speaker_profile.npz`）。快速路径直接复用向量，彻底省去重采样与 Speaker Encoder 前向开销，生成出的音色与音频提取完全逐位一致。若替换了源音频，mtime 校验会自动失效缓存并重新提取；若切换了不同架构模型，模型 ID 或向量维度不符的 sidecar 会被忽略并重新提取。
+- **并发与流式响应**：`MODEL.generate()` 不是线程安全的，模型 Metal 计算串行执行。流式接口 `/v1/tts/stream` 仅在逐块计算音频时持有模型锁，网络传输（yield）在锁外执行，慢速网络客户端不会堵塞其他并发 TTS / STT 请求。每次请求结束后会清理 MLX 缓存（上限 2 GB），并执行 GC。
 - **STT 按需加载**：Whisper 很少用，所以启动时不加载，收到第一个识别请求时才加载，空闲 10 分钟后自动卸载。调用方不需要做任何改动，只是加载后的第一个请求会慢约 2 秒。
 - **STT 只用 MLX**：`mlx-whisper` 在 Apple Silicon 上比 CPU 版快 4~5 倍（4.5 分钟音频约 11 秒），日语识别也更准，时间戳不容易漂移，所以没有设计 CPU 回退。MLX 出错时会直接报错，不会悄悄降级。第一次调用要加载模型，大约需要 20 秒。
 - **STT 后处理**：用词级时间戳收紧每段的起止时间，丢掉短于 0.2 秒的段，并对重叠的段去重、重新排序。

@@ -55,16 +55,31 @@ def run_fast(model, text):
     return audio
 
 
+def run_fast_profile(model, text, speaker_embed):
+    audio, _ = qwen3_fast.generate(
+        model, text, ref_audio=S.DEFAULT_REF_AUDIO, speaker_embed=speaker_embed,
+        lang_code=S.DEFAULT_LANG, max_tokens=max_tokens(text), **PARAMS,
+    )
+    return audio
+
+
 def main():
     S.patch_transformers_tokenizer_loader()
     mx.set_cache_limit(2 * 1024**3)
     model = S.load_model(S.DEFAULT_MODEL)
     assert qwen3_fast.supports(model, TEXTS[0], S.DEFAULT_REF_AUDIO, None)
+
+    from mlx_audio.utils import load_audio
+    ref_arr = load_audio(S.DEFAULT_REF_AUDIO, sample_rate=model.sample_rate)
+    cached_embed = model.extract_speaker_embedding(ref_arr)
+    mx.eval(cached_embed)
+
     run_original(model, TEXTS[0])
     run_fast(model, TEXTS[0])  # compile
+    run_fast_profile(model, TEXTS[0], cached_embed)
 
     ok = True
-    timings = {"original": [], "fast": []}
+    timings = {"original": [], "fast": [], "profile": []}
     for i, text in enumerate(TEXTS):
         seed = 1000 + i
         mx.random.seed(seed)
@@ -72,12 +87,22 @@ def main():
         a = run_original(model, text)
         timings["original"].append(time.perf_counter() - t0)
         mx.clear_cache()
+
         mx.random.seed(seed)
         t0 = time.perf_counter()
         b = run_fast(model, text)
         timings["fast"].append(time.perf_counter() - t0)
         mx.clear_cache()
-        same = a.shape == b.shape and bool(mx.array_equal(a, b))
+
+        mx.random.seed(seed)
+        t0 = time.perf_counter()
+        c = run_fast_profile(model, text, cached_embed)
+        timings["profile"].append(time.perf_counter() - t0)
+        mx.clear_cache()
+
+        same_fast = a.shape == b.shape and bool(mx.array_equal(a, b))
+        same_profile = a.shape == c.shape and bool(mx.array_equal(a, c))
+        same = same_fast and same_profile
         ok &= same
         print(f"{'OK  ' if same else 'DIFF'} {text}  ({a.shape[0] / model.sample_rate:.2f}s audio)")
 
