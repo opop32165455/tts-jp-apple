@@ -272,6 +272,17 @@ def patch_transformers_tokenizer_loader():
 # 括号内含汉字、英文、数字时（如 "東京（羽田）発"、"午後（14時）"）不匹配，保留原样朗读。
 RUBY_PATTERN = re.compile(r"([\u4e00-\u9faf]+)[（\(]([ぁ-んァ-ヶー]+)[）\)]")
 
+# 句末波浪线（～ / 〜 / ~）只是语气符号，模型会把它念成 "nani"，朗读前去掉。
+# 只去掉后面紧跟句末标点、空白或文本结尾的波浪线；"10～20"、"月～金" 这类表示范围的保留。
+TRAILING_TILDE_PATTERN = re.compile(r"[～〜~]+(?=[。、！？!?…」』）)\s]|$)")
+
+
+def normalize_tts_text(raw_text: str) -> str:
+    normalized = RUBY_PATTERN.sub(r"\2", raw_text)
+    if normalized != raw_text:
+        logger.info(f"[TTS FURIGANA] {raw_text!r} -> {normalized!r}")
+    return TRAILING_TILDE_PATTERN.sub("", normalized).strip()
+
 
 def _is_path_in_dir(path: str, base_dir: str) -> bool:
     try:
@@ -496,9 +507,9 @@ def synthesize_wav_bytes(req: TTSRequest) -> tuple[bytes, str, Optional[str], bo
     if not raw_text:
         raise ValueError("text is empty")
 
-    normalized = RUBY_PATTERN.sub(r"\2", raw_text)
-    if normalized != raw_text:
-        logger.info(f"[TTS FURIGANA] {raw_text!r} -> {normalized!r}")
+    normalized = normalize_tts_text(raw_text)
+    if not normalized:
+        raise ValueError("text is empty")
 
     temperature = (
         req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
@@ -668,9 +679,9 @@ def stream_audio_generator(req: TTSRequest):
     if not raw_text:
         raise ValueError("text is empty")
 
-    normalized = RUBY_PATTERN.sub(r"\2", raw_text)
-    if normalized != raw_text:
-        logger.info(f"[TTS FURIGANA] {raw_text!r} -> {normalized!r}")
+    normalized = normalize_tts_text(raw_text)
+    if not normalized:
+        raise ValueError("text is empty")
 
     temperature = (
         req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE
